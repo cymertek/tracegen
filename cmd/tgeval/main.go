@@ -8,9 +8,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"flag"
+	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync/atomic"
+	"time"
+	"math"
 
 	"github.com/cymertek/tracegen/internal/generator"
 	"github.com/cymertek/tracegen/internal/parser"
@@ -108,6 +113,8 @@ func evalCommand(args []string) {
 	fs.BoolVar(&quiet, "q", false, "Suppress progress messages")
 	fs.BoolVar(&quiet, "quiet", false, "Suppress progress messages")
 	fs.BoolVar(&verbose, "v", false, "Show detailed evaluation information")
+	var progress bool
+	fs.BoolVar(&progress, "progress", false, "Show progress updates every 2 seconds (prefixed with #)")
 
 	_ = fs.Parse(args)
 	files = fs.Args()
@@ -118,7 +125,7 @@ func evalCommand(args []string) {
 	}
 
 	for _, mpFile := range files {
-		if err := evaluate(mpFile, scope, output, quiet, verbose); err != nil {
+		if err := evaluate(mpFile, scope, output, quiet, verbose, progress); err != nil {
 			fmt.Fprintf(os.Stderr, "Error evaluating %s: %v\n", mpFile, err)
 			os.Exit(1)
 		}
@@ -194,7 +201,7 @@ func summaryCommand(args []string) {
 }
 
 // evaluate parses an MP file and generates trace segments via SQLite-backed streaming.
-func evaluate(mpFile string, scope int, outputPath string, quiet bool, verbose bool) error {
+func evaluate(mpFile string, scope int, outputPath string, quiet bool, verbose bool, showProgress bool) error {
 	input, err := os.ReadFile(mpFile)
 	if err != nil {
 		return fmt.Errorf("reading %s: %w", mpFile, err)
@@ -239,41 +246,62 @@ func evaluate(mpFile string, scope int, outputPath string, quiet bool, verbose b
 		return fmt.Errorf("generating traces for %s: %w", mpFile, err)
 	}
 
-	uniqueCount, _ := dbStore.TotalTraces()
+	uniqueCount, err := dbStore.QueryCount()
+	if err != nil {
+		return fmt.Errorf("querying trace count: %w", err)
+	}
 	totalInstances, _ := dbStore.TotalInstances()
 
 	if !quiet {
 		fmt.Fprintf(os.Stderr, "[INFO] Generated %d unique trace patterns (%d total instances)\n", uniqueCount, totalInstances)
 	}
 
-	// Produce pretty-printed JSON output from SQLite (matches C++ format exactly).
-	jsonOutput, err := generator.MarshalToJSONFromStore(dbStore)
-	if err != nil {
-		return fmt.Errorf("marshaling traces to JSON: %w", err)
-	}
+	// GC hint: free intermediate slices from generation before streaming output.
+	runtime.GC()
 
-	if outputPath == "" || outputPath == "-" {
-		fmt.Print(jsonOutput)
-	} else {
+	// Stream JSON output directly from SQLite cursor — no in-memory accumulation.
+	var writer io.Writer = os.Stdout
+	if outputPath != "" && outputPath != "-" {
 		outputDir := filepath.Dir(outputPath)
 		if outputDir != "." && outputDir != "" {
 			if err := os.MkdirAll(outputDir, 0755); err != nil {
 				return fmt.Errorf("creating output directory %s: %w", outputDir, err)
 			}
 		}
-		if err := os.WriteFile(outputPath, []byte(jsonOutput), 0644); err != nil {
-			return fmt.Errorf("writing output to %s: %w", outputPath, err)
+		f, err := os.Create(outputPath)
+		if err != nil {
+			return fmt.Errorf("opening output file %s: %w", outputPath, err)
 		}
-		if !quiet {
-			fmt.Printf("%d unique traces written to %s\n", uniqueCount, outputPath)
-		}
+		defer f.Close()
+		writer = f
+	}
+
+	sw := generator.NewStreamWriter(writer, 0) // unlimited traces
+
+	// Start progress reporter if requested.
+	var updateProgress func(count int64)
+	if showProgress {
+		updateProgress = startProgressReporter(dbStore, uniqueCount)
+	}
+
+	if err := generator.StreamTracesToWriter(dbStore, sw, updateProgress); err != nil {
+		return fmt.Errorf("streaming traces to output: %w", err)
+	}
+
+	// Flush progress reporter - wait for goroutine to print final status
+	if showProgress {
+		time.Sleep(2 * time.Second)
+	}
+
+	if outputPath != "" && outputPath != "-" && !quiet {
+		fmt.Printf("%d unique traces written to %s\n", uniqueCount, outputPath)
 	}
 
 	return nil
 }
 
-// traceCount parses an MP file and returns the number of trace segments without marshaling JSON.
-func traceCount(mpFile string, scope int) (int, error) {
+// traceCount parses an MP file and returns the number of unique trace segments using SQLite dedup.
+func traceCount(mpFile string, scope int) (int64, error) {
 	input, err := os.ReadFile(mpFile)
 	if err != nil {
 		return 0, fmt.Errorf("reading %s: %w", mpFile, err)
@@ -290,12 +318,27 @@ func traceCount(mpFile string, scope int) (int, error) {
 	}
 
 	gen := generator.NewCPUGenerator(0)
-	traces, err := gen.GenerateTraces(schemaNode, scope)
+
+	dbStore, err := store.NewSQLiteStore(".")
 	if err != nil {
+		return 0, fmt.Errorf("creating SQLite store: %w", err)
+	}
+	defer dbStore.Close()
+
+	if err := dbStore.ClearAll(); err != nil {
+		return 0, fmt.Errorf("clearing trace store: %w", err)
+	}
+
+	if err := gen.GenerateTracesToSQLite(schemaNode, scope, dbStore); err != nil {
 		return 0, fmt.Errorf("generating traces for %s: %w", mpFile, err)
 	}
 
-	return len(traces), nil
+	count, err := dbStore.QueryCount()
+	if err != nil {
+		return 0, fmt.Errorf("querying trace count: %w", err)
+	}
+
+	return count, nil
 }
 
 // evaluateSummary generates a text summary of trace statistics.
@@ -388,4 +431,65 @@ func buildSummary(traces []generator.TraceSegment, schemaName string, scope int)
 	}
 
 	return sum
+}
+
+// startProgressReporter starts a background goroutine that prints progress every 2 seconds as JSON.
+// Progress lines are prefixed with "# [PROGRESS] " followed by a JSON object.
+// Format example: # [PROGRESS] {"seconds": 2.1, "done":6, "total":10, "perSecond": 10.7, "percent":60.3}
+// startProgressReporter starts a background goroutine that prints progress every 2 seconds as JSON.
+// Progress lines are prefixed with "# [PROGRESS] " followed by a JSON object.
+// Format example: # [PROGRESS] {"seconds": 2.1, "done":6, "total":10, "perSecond": 10.7, "percent":60.3}
+func startProgressReporter(dbStore *store.SQLiteStore, totalTraces int64) func(int64) {
+	var currentCount atomic.Int64
+	var sampleIndex int64
+
+	// Tape history for moving average (5 samples)
+	type sample struct {
+		count int64
+		time  time.Time
+	}
+	tape := make([]sample, 5)
+
+	go func() {
+		startTime := time.Now()
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+
+		for range ticker.C {
+			// Flush any buffered writes before reading stats
+			dbStore.Flush() //nolint:errcheck
+			count := currentCount.Load()
+			if totalTraces > 0 && count > 0 {
+				pct := float64(count) / float64(totalTraces) * 100
+				elapsed := time.Since(startTime).Seconds()
+
+				// Calculate moving average rate (3 significant figures)
+				idx := int(sampleIndex % 5)
+				prevIdx := int((sampleIndex - 1 + 5) % 5)
+
+				var rate float64
+				if sampleIndex > 0 && tape[prevIdx].time.Before(tape[idx].time) {
+					delta := count - tape[prevIdx].count
+					timeDiff := time.Since(tape[prevIdx].time).Seconds()
+					rate = float64(delta) / math.Min(timeDiff, 10.0)
+				} else {
+					rate = float64(count) / math.Min(elapsed, 10.0)
+				}
+
+				// Format JSON with specific precision: 0.1 for most fields, 3 sig figs for perSecond
+				fmt.Fprintf(os.Stderr, "# [PROGRESS] {\"seconds\": %.1f, \"done\": %d, \"total\": %d, \"perSecond\": %.3g, \"percent\": %.1f}\n",
+					elapsed, count, totalTraces, rate, pct)
+
+				tape[idx] = sample{count: count, time: time.Now()}
+				sampleIndex++
+			} else if count > 0 {
+				elapsed := time.Since(startTime).Seconds()
+				fmt.Fprintf(os.Stderr, "# [PROGRESS] {\"seconds\": %.1f, \"done\": %d}\n", elapsed, count)
+			}
+		}
+	}()
+
+	return func(count int64) {
+		currentCount.Store(count)
+	}
 }

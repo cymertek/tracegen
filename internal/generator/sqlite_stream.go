@@ -6,6 +6,7 @@ package generator
 import (
 	"encoding/json"
 	"fmt"
+	"runtime"
 
 	"github.com/cymertek/tracegen/internal/parser"
 	"github.com/cymertek/tracegen/internal/store"
@@ -42,6 +43,11 @@ func (g *CPUGenerator) GenerateTracesToSQLite(schema *parser.SchemaNode, scope i
 			}
 			totalInserted++
 		}
+
+		// GC hint: release intermediate slices before processing next coordinate block.
+		coordTraces = nil
+		dedupedTraces = nil
+		runtime.GC()
 	}
 
 	// Include standalone root traces if no coordinate traces were produced.
