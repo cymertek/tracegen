@@ -15,7 +15,6 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
-	"math"
 
 	"github.com/cymertek/tracegen/internal/generator"
 	"github.com/cymertek/tracegen/internal/parser"
@@ -72,6 +71,7 @@ Commands:
       -o FILE            Output file path (default: stdout)
       -q, --quiet        Suppress progress messages
       -v, --verbose      Show detailed evaluation information
+      --progress         Enable progress updates every 2 seconds
 
       All evaluations use SQLite-backed streaming with automatic deduplication.
 
@@ -100,11 +100,13 @@ Examples:
 // evalCommand handles "tgeval eval <file.mp>".
 func evalCommand(args []string) {
 	var (
-		scope   int
-		output  string
-		quiet   bool
-		verbose bool
-		files   []string
+		scope       int
+		output      string
+		quiet       bool
+		verbose     bool
+		progress    bool
+		analyzeDeps bool
+		files       []string
 	)
 
 	fs := flag.NewFlagSet("eval", flag.ExitOnError)
@@ -113,8 +115,8 @@ func evalCommand(args []string) {
 	fs.BoolVar(&quiet, "q", false, "Suppress progress messages")
 	fs.BoolVar(&quiet, "quiet", false, "Suppress progress messages")
 	fs.BoolVar(&verbose, "v", false, "Show detailed evaluation information")
-	var progress bool
 	fs.BoolVar(&progress, "progress", false, "Show progress updates every 2 seconds (prefixed with #)")
+	fs.BoolVar(&analyzeDeps, "analyze-deps", false, "Analyze coordinate dependencies and print summary")
 
 	_ = fs.Parse(args)
 	files = fs.Args()
@@ -125,7 +127,7 @@ func evalCommand(args []string) {
 	}
 
 	for _, mpFile := range files {
-		if err := evaluate(mpFile, scope, output, quiet, verbose, progress); err != nil {
+		if err := evaluate(mpFile, scope, output, quiet, verbose, progress, analyzeDeps); err != nil {
 			fmt.Fprintf(os.Stderr, "Error evaluating %s: %v\n", mpFile, err)
 			os.Exit(1)
 		}
@@ -201,7 +203,7 @@ func summaryCommand(args []string) {
 }
 
 // evaluate parses an MP file and generates trace segments via SQLite-backed streaming.
-func evaluate(mpFile string, scope int, outputPath string, quiet bool, verbose bool, showProgress bool) error {
+func evaluate(mpFile string, scope int, outputPath string, quiet bool, verbose bool, showProgress bool, analyzeDeps bool) error {
 	input, err := os.ReadFile(mpFile)
 	if err != nil {
 		return fmt.Errorf("reading %s: %w", mpFile, err)
@@ -213,6 +215,15 @@ func evaluate(mpFile string, scope int, outputPath string, quiet bool, verbose b
 	}
 
 	schemaNode, err := parser.NewParser(tokens).Parse()
+	if err != nil {
+		return fmt.Errorf("parsing %s: %w", mpFile, err)
+	}
+
+	// Print dependency analysis if requested (before generation starts)
+	if analyzeDeps && !quiet {
+		generator.PrintDependencyAnalysis(schemaNode)
+		fmt.Fprintln(os.Stderr) // Add blank line after analysis
+	}
 	if err != nil {
 		return fmt.Errorf("parsing %s: %w", mpFile, err)
 	}
@@ -244,6 +255,11 @@ func evaluate(mpFile string, scope int, outputPath string, quiet bool, verbose b
 	// Stream generation directly to SQLite — no in-memory accumulation.
 	if err := gen.GenerateTracesToSQLite(schemaNode, scope, dbStore); err != nil {
 		return fmt.Errorf("generating traces for %s: %w", mpFile, err)
+	}
+
+	// Flush any buffered records before querying count
+	if err := dbStore.Flush(); err != nil {
+		return fmt.Errorf("flushing trace store: %w", err)
 	}
 
 	uniqueCount, err := dbStore.QueryCount()
@@ -281,7 +297,8 @@ func evaluate(mpFile string, scope int, outputPath string, quiet bool, verbose b
 	// Start progress reporter if requested.
 	var updateProgress func(count int64)
 	if showProgress {
-		updateProgress = startProgressReporter(dbStore, uniqueCount)
+		flushFn := func() { _ = dbStore.Flush() }
+		updateProgress = startProgressReporter(uniqueCount, flushFn)
 	}
 
 	if err := generator.StreamTracesToWriter(dbStore, sw, updateProgress); err != nil {
@@ -302,6 +319,7 @@ func evaluate(mpFile string, scope int, outputPath string, quiet bool, verbose b
 
 // traceCount parses an MP file and returns the number of unique trace segments using SQLite dedup.
 func traceCount(mpFile string, scope int) (int64, error) {
+	fmt.Printf("[TRACE] Starting traceCount for %s scope=%d\n", mpFile, scope)
 	input, err := os.ReadFile(mpFile)
 	if err != nil {
 		return 0, fmt.Errorf("reading %s: %w", mpFile, err)
@@ -331,6 +349,11 @@ func traceCount(mpFile string, scope int) (int64, error) {
 
 	if err := gen.GenerateTracesToSQLite(schemaNode, scope, dbStore); err != nil {
 		return 0, fmt.Errorf("generating traces for %s: %w", mpFile, err)
+	}
+
+	// Flush buffered writes before querying count
+	if err := dbStore.Flush(); err != nil {
+		return 0, fmt.Errorf("flushing trace store: %w", err)
 	}
 
 	count, err := dbStore.QueryCount()
@@ -438,12 +461,12 @@ func buildSummary(traces []generator.TraceSegment, schemaName string, scope int)
 // Format example: # [PROGRESS] {"seconds": 2.1, "done":6, "total":10, "perSecond": 10.7, "percent":60.3}
 // startProgressReporter starts a background goroutine that prints progress every 2 seconds as JSON.
 // Progress lines are prefixed with "# [PROGRESS] " followed by a JSON object.
-// Format example: # [PROGRESS] {"seconds": 2.1, "done":6, "total":10, "perSecond": 10.7, "percent":60.3}
-func startProgressReporter(dbStore *store.SQLiteStore, totalTraces int64) func(int64) {
+// Format example: # [PROGRESS] {"seconds": 2.1, "done":6, "total":10, "perSecond": 10.7, "percent":60.3, "eta": "1h30m15s"}
+func startProgressReporter(totalTraces int64, flushFn func()) func(int64) {
 	var currentCount atomic.Int64
 	var sampleIndex int64
 
-	// Tape history for moving average (5 samples)
+	// Tape history for moving average (5 samples over ~10 seconds at 2s intervals)
 	type sample struct {
 		count int64
 		time  time.Time
@@ -456,29 +479,72 @@ func startProgressReporter(dbStore *store.SQLiteStore, totalTraces int64) func(i
 		defer ticker.Stop()
 
 		for range ticker.C {
-			// Flush any buffered writes before reading stats
-			dbStore.Flush() //nolint:errcheck
 			count := currentCount.Load()
 			if totalTraces > 0 && count > 0 {
 				pct := float64(count) / float64(totalTraces) * 100
 				elapsed := time.Since(startTime).Seconds()
 
-				// Calculate moving average rate (3 significant figures)
+				// Flush buffered writes to get accurate counts
+				if flushFn != nil {
+					flushFn()
+				}
+
+				// Calculate moving average rate using samples over ~10 seconds
 				idx := int(sampleIndex % 5)
-				prevIdx := int((sampleIndex - 1 + 5) % 5)
+				prevIdx := int((sampleIndex - 4 + 5) % 5) // 4 samples back = ~8-10 seconds
 
 				var rate float64
-				if sampleIndex > 0 && tape[prevIdx].time.Before(tape[idx].time) {
+				if sampleIndex >= 4 && tape[prevIdx].time.Before(tape[idx].time) {
 					delta := count - tape[prevIdx].count
 					timeDiff := time.Since(tape[prevIdx].time).Seconds()
-					rate = float64(delta) / math.Min(timeDiff, 10.0)
+					if timeDiff > 0 {
+						rate = float64(delta) / timeDiff
+					}
+				} else if sampleIndex >= 1 {
+					// Use overall average for first few samples (after first progress update)
+					elapsed := time.Since(startTime).Seconds()
+					if elapsed > 0 {
+						rate = float64(count) / elapsed
+					}
 				} else {
-					rate = float64(count) / math.Min(elapsed, 10.0)
+					// First sample - use instant rate from start
+					elapsed := time.Since(startTime).Seconds()
+					if elapsed > 0 {
+						rate = float64(count) / elapsed
+					}
+				}
+
+				// Calculate ETA based on rate and remaining traces
+				var eta string
+				if rate > 0 {
+					remaining := int64(totalTraces - count)
+					etaSeconds := float64(remaining) / rate
+					etaDuration := time.Duration(etaSeconds * float64(time.Second))
+
+					// Format as Go duration: "1h30m15s" or "30m15s" or "45s" or "0.5s"
+					hours := int(etaDuration.Hours())
+					minutes := int(etaDuration.Minutes()) % 60
+					seconds := int(etaDuration.Seconds()) % 60
+
+					if hours > 0 {
+						eta = fmt.Sprintf("%dh%dm%ds", hours, minutes, seconds)
+					} else if minutes > 0 {
+						eta = fmt.Sprintf("%dm%ds", minutes, seconds)
+					} else if etaDuration >= time.Second {
+						eta = fmt.Sprintf("%.1fs", etaSeconds)
+					} else {
+						eta = "instant"
+					}
 				}
 
 				// Format JSON with specific precision: 0.1 for most fields, 3 sig figs for perSecond
-				fmt.Fprintf(os.Stderr, "# [PROGRESS] {\"seconds\": %.1f, \"done\": %d, \"total\": %d, \"perSecond\": %.3g, \"percent\": %.1f}\n",
-					elapsed, count, totalTraces, rate, pct)
+				if eta != "" {
+					fmt.Fprintf(os.Stderr, "# [PROGRESS] {\"seconds\": %.1f, \"done\": %d, \"total\": %d, \"perSecond\": %.3g, \"percent\": %.1f, \"eta\": \"%s\"}\n",
+						elapsed, count, totalTraces, rate, pct, eta)
+				} else {
+					fmt.Fprintf(os.Stderr, "# [PROGRESS] {\"seconds\": %.1f, \"done\": %d, \"total\": %d, \"perSecond\": %.3g, \"percent\": %.1f}\n",
+						elapsed, count, totalTraces, rate, pct)
+				}
 
 				tape[idx] = sample{count: count, time: time.Now()}
 				sampleIndex++

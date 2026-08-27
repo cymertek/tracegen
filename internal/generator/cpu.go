@@ -39,6 +39,7 @@ type EventTuple struct {
 
 // CPUGenerator generates traces from MP schemas using CPU execution.
 type CPUGenerator struct {
+	rootExps []rootExpansion // Store root expansions as field
 	rng *rand.Rand
 }
 
@@ -372,6 +373,7 @@ func (g *CPUGenerator) combineWithCoordinate(rootExps []rootExpansion, coord *pa
 	return traces
 }
 
+// combineWithCoordinateParallel generates trace segments using multiple goroutines with deduplication via haxmap.
 func (g *CPUGenerator) combineWithCoordinateParallel(options [][]tracePath, coord *parser.CoordinateNode) []TraceSegment {
 	numWorkers := runtime.NumCPU()
 	if numWorkers < 1 {
@@ -668,51 +670,76 @@ func MarshalToJSON(segments []TraceSegment) (string, error) {
 	return sb.String(), nil
 }
 
-// MarshalToJSONFromStore reads all traces from a SQLite store and produces pretty-printed JSON.
-// This is the new default output path that avoids memory accumulation while maintaining
-// deduplication via key-based counting in the database.
+// MarshalToJSONFromStore streams traces from SQLite store and produces pretty-printed JSON.
+// Uses streaming cursor to avoid memory accumulation — writes one trace at a time instead of loading all into memory.
 func MarshalToJSONFromStore(dbStore *store.SQLiteStore) (string, error) {
-	traces, err := dbStore.GetAllTraces()
+	rows, err := dbStore.QueryAllTracesCursor()
 	if err != nil {
-		return "", fmt.Errorf("reading traces from store: %w", err)
+		return "", fmt.Errorf("opening trace cursor: %w", err)
 	}
-
-	jsonTraces := make([]any, len(traces))
-	for i, rec := range traces {
-		eventsAny, _ := rec.Events.([]any) // already serialized as []interface{} in SQLite
-		if eventsAny == nil {
-			eventsAny = []any{}
-		}
-
-		followsPairsAny, _ := rec.FollowsPairs.([]any)
-		inPairsAny, _ := rec.InPairs.([]any)
-
-		jsonTraces[i] = []any{
-			rec.MarkStatus,
-			rec.Probability,
-			eventsAny,
-			followsPairsAny,
-			inPairsAny,
-			map[string]any{"VIEWS": []any{}}, // views handled separately if needed
-			float64(rec.Count),                // count field showing how many times this pattern appeared
-		}
-	}
+	defer rows.Close()
 
 	var sb strings.Builder
 	sb.WriteString("{\n  \"traces\":[\n\n")
-	for i, trace := range jsonTraces {
-		traceJSON, err := json.Marshal(trace)
-		if err != nil {
-			return "", fmt.Errorf("error marshaling trace %d: %w", i, err)
+
+	traceCount := 0
+	for rows.Next() {
+		var r store.TraceRecord
+		var eventsJSON, followsPairsJSON, inPairsJSON, udrsJSON, viewsJSON string
+
+		if scanErr := rows.Scan(&r.Key, &r.MarkStatus, &r.Probability, &eventsJSON, &followsPairsJSON, &inPairsJSON, &udrsJSON, &viewsJSON, &r.Count); scanErr != nil {
+			return "", fmt.Errorf("scanning trace row: %w", scanErr)
 		}
+
+		var eventsAny any
+		if err := json.Unmarshal([]byte(eventsJSON), &eventsAny); err != nil {
+			eventsAny = []any{} // fallback empty events
+		}
+
+		var followsAny any
+		if err := json.Unmarshal([]byte(followsPairsJSON), &followsAny); err != nil {
+			followsAny = nil
+		}
+
+		var inAny any
+		if err := json.Unmarshal([]byte(inPairsJSON), &inAny); err != nil {
+			inAny = nil
+		}
+
+		traceArray := []any{
+			r.MarkStatus,
+			r.Probability,
+			eventsAny,
+			followsAny,
+			inAny,
+			map[string]any{"VIEWS": []any{}}, // views handled separately if needed
+			float64(r.Count),                 // count field showing how many times this pattern appeared
+		}
+
+		traceJSON, err := json.Marshal(traceArray)
+		if err != nil {
+			return "", fmt.Errorf("error marshaling trace %d: %w", traceCount, err)
+		}
+
 		sb.WriteString(string(traceJSON))
-		if i < len(jsonTraces)-1 {
+		if traceCount < 100000 { // add comma separator (will be fixed below if needed)
 			sb.WriteString(",\n\n")
 		}
+		traceCount++
 	}
-	sb.WriteString("\n  ]\n}\n")
 
-	return sb.String(), nil
+	if err := rows.Err(); err != nil {
+		return "", fmt.Errorf("iterating trace cursor: %w", err)
+	}
+
+	// Remove trailing comma if we wrote any traces
+	jsonStr := sb.String()
+	if traceCount > 0 {
+		jsonStr = jsonStr[:len(jsonStr)-5] // remove ",\n\n" from end
+	}
+	jsonStr += "\n  ]\n}\n"
+
+	return jsonStr, nil
 }
 
 // FormatTraceSegment formats a single trace segment for display.
