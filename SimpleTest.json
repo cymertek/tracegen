@@ -1,0 +1,22 @@
+{
+  "traces": [
+    {
+      "MarkStatus": "U",
+      "Probability": 0,
+      "Events": [],
+      "FollowsPairs": [],
+      "InPairs": [],
+      "UDRs": {},
+      "Views": []
+    },
+    {
+      "MarkStatus": "U",
+      "Probability": 0,
+      "Events": [],
+      "FollowsPairs": [],
+      "InPairs": [],
+      "UDRs": {},
+      "Views": []
+    }
+  ]
+}

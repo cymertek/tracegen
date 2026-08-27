@@ -12,42 +12,48 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 
 	_ "modernc.org/sqlite" // pure Go SQLite driver - no CGO needed
 )
 
 // TraceRecord represents a stored trace segment with deduplication count.
 type TraceRecord struct {
-	Key           string `json:"-"`
-	MarkStatus    string `json:"mark_status"`
-	Probability   float64 `json:"probability"`
-	Events        any     `json:"events"` // []any of event tuples
-	FollowsPairs  any     `json:"follows_pairs"`
-	InPairs       any     `json:"in_pairs"`
-	UDRs          any     `json:"udrs,omitempty"`
-	Views         any     `json:"views,omitempty"`
-	Count         int64   `json:"count"` // how many times this pattern appeared
+	Key           string      `json:"-"`
+	MarkStatus    string      `json:"mark_status"`
+	Probability   float64     `json:"probability"`
+	Events        interface{} `json:"events"` // []interface{} of event tuples
+	FollowsPairs  interface{} `json:"follows_pairs"`
+	InPairs       interface{} `json:"in_pairs"`
+	UDRs          interface{} `json:"udrs,omitempty"`
+	Views         interface{} `json:"views,omitempty"`
+	Count         int64       `json:"count"` // how many times this pattern appeared
 }
 
 // SQLiteStore manages trace storage with automatic deduplication via a local SQLite database.
 type SQLiteStore struct {
-	db          *sql.DB
-	path        string
-	closed      bool
-	buffered    []bufferedRecord
-	flushOnNext bool
+	db     *sql.DB
+	path   string
+	closed bool
+
+	// Transaction batching for write performance - prevents drive hammering
+	txBatchSize int
+	currentTx   *sql.Tx
+	bufferedRecords []insertRecord
+
+	// Mutex to protect concurrent writes from parallel coordinate processing
+	mu sync.Mutex
 }
 
-// bufferedRecord holds one insert prepared for batching into a transaction.
-type bufferedRecord struct {
-	key           string
-	markStatus    string
-	probability   float64
-	eventsJSON    string
-	followsPairs  string
-	inPairs       string
-	udrsJSON      string
-	viewsJSON     string
+type insertRecord struct {
+	key          string
+	markStatus   string
+	probability  float64
+	eventsJSON   []byte
+	followsPairs []byte
+	inPairs      []byte
+	udrsJSON     []byte
+	viewsJSON    []byte
 }
 
 // NewSQLiteStore opens or creates a SQLite database in the given directory.
@@ -70,7 +76,7 @@ func NewSQLiteStore(dir string) (*SQLiteStore, error) {
 		return nil, fmt.Errorf("opening sqlite store: %w", err)
 	}
 
-	// Enable WAL mode for better concurrent performance and reduce drive hammering
+	// Enable WAL mode for better concurrent performance
 	if _, err := db.Exec("PRAGMA journal_mode=WAL"); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("setting WAL mode: %w", err)
@@ -106,6 +112,7 @@ func (s *SQLiteStore) createTable() error {
 		return fmt.Errorf("creating traces table: %w", err)
 	}
 
+	// Index on count for sorting by frequency if needed later
 	indexQuery := `CREATE INDEX IF NOT EXISTS idx_traces_count ON traces(count DESC);`
 	if _, err := s.db.Exec(indexQuery); err != nil {
 		return fmt.Errorf("creating index: %w", err)
@@ -115,8 +122,12 @@ func (s *SQLiteStore) createTable() error {
 }
 
 // InsertOrIncrement buffers a new trace or increments the count for an existing one.
-// Inserts are batched into transactions to prevent drive hammering.
+// This is the deduplication mechanism: if two traces have identical event sequences,
+// they share the same key and only the count field increases.
+// Inserts are buffered and committed in batches to prevent drive hammering.
 func (s *SQLiteStore) InsertOrIncrement(key string, record TraceRecord) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	eventsJSON, err := json.Marshal(record.Events)
 	if err != nil {
 		return fmt.Errorf("marshaling events: %w", err)
@@ -135,30 +146,31 @@ func (s *SQLiteStore) InsertOrIncrement(key string, record TraceRecord) error {
 	udrsJSON, _ := json.Marshal(record.UDRs)
 	viewsJSON, _ := json.Marshal(record.Views)
 
-	s.buffered = append(s.buffered, bufferedRecord{
+	s.bufferedRecords = append(s.bufferedRecords, insertRecord{
 		key:          key,
 		markStatus:   record.MarkStatus,
 		probability:  record.Probability,
-		eventsJSON:   string(eventsJSON),
-		followsPairs: string(followsPairsJSON),
-		inPairs:      string(inPairsJSON),
-		udrsJSON:     string(udrsJSON),
-		viewsJSON:    string(viewsJSON),
+		eventsJSON:   eventsJSON,
+		followsPairs: followsPairsJSON,
+		inPairs:      inPairsJSON,
+		udrsJSON:     udrsJSON,
+		viewsJSON:    viewsJSON,
 	})
 
-	// Auto-flush when buffer reaches 100 records to prevent drive hammering
-	if len(s.buffered) >= 100 {
+	// Auto-flush when buffer reaches threshold (100 records)
+	if len(s.bufferedRecords) >= 100 {
 		return s.Flush()
 	}
 
-	s.flushOnNext = true
 	return nil
 }
 
 // Flush commits all buffered records to SQLite in a single transaction.
+// This prevents drive hammering by batching multiple inserts into one transaction.
 func (s *SQLiteStore) Flush() error {
-	if len(s.buffered) == 0 {
-		s.flushOnNext = false
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.bufferedRecords) == 0 {
 		return nil
 	}
 
@@ -178,8 +190,8 @@ func (s *SQLiteStore) Flush() error {
 	}
 	defer stmt.Close()
 
-	for _, rec := range s.buffered {
-		if _, err := stmt.Exec(rec.key, rec.markStatus, rec.probability, rec.eventsJSON, rec.followsPairs, rec.inPairs, rec.udrsJSON, rec.viewsJSON); err != nil {
+	for _, rec := range s.bufferedRecords {
+		if _, err := stmt.Exec(rec.key, rec.markStatus, rec.probability, string(rec.eventsJSON), string(rec.followsPairs), string(rec.inPairs), string(rec.udrsJSON), string(rec.viewsJSON)); err != nil {
 			tx.Rollback() //nolint:errcheck
 			return fmt.Errorf("executing insert: %w", err)
 		}
@@ -190,17 +202,12 @@ func (s *SQLiteStore) Flush() error {
 		return fmt.Errorf("committing transaction: %w", err)
 	}
 
-	s.buffered = s.buffered[:0]
-	s.flushOnNext = false
+	s.bufferedRecords = s.bufferedRecords[:0] // clear buffer
 	return nil
 }
 
 // GetAllTraces retrieves all stored traces sorted by key (deterministic order).
 func (s *SQLiteStore) GetAllTraces() ([]TraceRecord, error) {
-	if err := s.Flush(); err != nil {
-		return nil, fmt.Errorf("flushing before read: %w", err)
-	}
-
 	query := `SELECT trace_key, mark_status, probability, events_json, follows_pairs_json, in_pairs_json, udrs_json, views_json, count FROM traces ORDER BY trace_key`
 
 	rows, err := s.db.Query(query)
@@ -231,7 +238,7 @@ func (s *SQLiteStore) GetAllTraces() ([]TraceRecord, error) {
 			r.UDRs = map[string][]int{} // fallback empty
 		}
 		if err := json.Unmarshal([]byte(viewsJSON), &r.Views); err != nil {
-			r.Views = []any{} // fallback empty
+			r.Views = []interface{}{} // fallback empty
 		}
 
 		records = append(records, r)
@@ -242,9 +249,6 @@ func (s *SQLiteStore) GetAllTraces() ([]TraceRecord, error) {
 
 // TotalTraces returns the total number of unique trace keys stored.
 func (s *SQLiteStore) TotalTraces() (int64, error) {
-	if err := s.Flush(); err != nil {
-		return 0, fmt.Errorf("flushing before count: %w", err)
-	}
 	var count int64
 	err := s.db.QueryRow("SELECT COUNT(*) FROM traces").Scan(&count)
 	return count, err
@@ -252,35 +256,9 @@ func (s *SQLiteStore) TotalTraces() (int64, error) {
 
 // TotalInstances returns the sum of all counts (total trace instances before dedup).
 func (s *SQLiteStore) TotalInstances() (int64, error) {
-	if err := s.Flush(); err != nil {
-		return 0, fmt.Errorf("flushing before count: %w", err)
-	}
 	var total int64
 	err := s.db.QueryRow("SELECT SUM(count) FROM traces").Scan(&total)
 	return total, err
-}
-
-// QueryAllTracesCursor returns a row cursor for streaming iteration over all stored traces.
-// Caller must call rows.Close() when done iterating.
-func (s *SQLiteStore) QueryAllTracesCursor() (*sql.Rows, error) {
-	if s.flushOnNext || len(s.buffered) > 0 {
-		if err := s.Flush(); err != nil {
-			return nil, fmt.Errorf("flushing before cursor: %w", err)
-		}
-	}
-
-	query := `SELECT trace_key, mark_status, probability, events_json, follows_pairs_json, in_pairs_json, udrs_json, views_json, count FROM traces ORDER BY trace_key`
-	return s.db.Query(query)
-}
-
-// QueryCount returns the number of unique trace keys stored via a pure SQL query.
-func (s *SQLiteStore) QueryCount() (int64, error) {
-	if err := s.Flush(); err != nil {
-		return 0, fmt.Errorf("flushing before count: %w", err)
-	}
-	var count int64
-	err := s.db.QueryRow("SELECT COUNT(*) FROM traces").Scan(&count)
-	return count, err
 }
 
 // Close shuts down the SQLite connection and cleans up WAL files.
@@ -289,34 +267,53 @@ func (s *SQLiteStore) Close() error {
 		return nil
 	}
 	s.closed = true
-	// Flush any remaining buffered records before closing
-	if len(s.buffered) > 0 {
-		s.Flush() //nolint:errcheck
-	}
 	return s.db.Close()
 }
 
 // ClearAll removes all traces from the store but keeps the database file.
 func (s *SQLiteStore) ClearAll() error {
-	if _, err := s.db.Exec("DELETE FROM traces"); err != nil {
-		return err
-	}
-	s.buffered = s.buffered[:0] // clear any buffered records after delete
-	return nil
+	_, err := s.db.Exec("DELETE FROM traces")
+	return err
+}
+
+// QueryAllTracesCursor returns a row cursor for streaming iteration over all stored traces.
+// Caller must call rows.Close() when done iterating.
+// This is the memory-efficient alternative to GetAllTraces() which loads everything into memory.
+func (s *SQLiteStore) QueryAllTracesCursor() (*sql.Rows, error) {
+	query := `SELECT trace_key, mark_status, probability, events_json, follows_pairs_json, in_pairs_json, udrs_json, views_json, count FROM traces ORDER BY trace_key`
+	return s.db.Query(query)
+}
+
+// QueryCount returns the number of unique trace keys stored via a pure SQL query.
+// Zero memory for trace data — only returns the integer count.
+func (s *SQLiteStore) QueryCount() (int64, error) {
+	var count int64
+	err := s.db.QueryRow("SELECT COUNT(*) FROM traces").Scan(&count)
+	return count, err
 }
 
 // GenerateTraceKey creates a deterministic hash key for a trace based on its combined event sequence.
-func GenerateTraceKey(events any) string {
+// This is used to identify duplicate traces across different coordinate blocks or generation paths.
+func GenerateTraceKey(events interface{}) string {
+	// Marshal events to canonical JSON (sorted keys, no whitespace) for consistent hashing
 	data, err := json.Marshal(events)
 	if err != nil {
 		return fmt.Sprintf("error:%v", err)
 	}
 
+	// Use simple FNV-1a hash for speed (good enough for deduplication purposes)
 	var h uint32 = 2166136261 // FNV offset basis
 	for _, b := range data {
 		h ^= uint32(b)
 		h *= 16777619 // FNV prime
 	}
 
-	return fmt.Sprintf("%08x", h) + ":" + string(data[:min(len(data), 50)])
+	return fmt.Sprintf("%08x", h) + ":" + string(data[:min(len(data), 50)]) // prefix with hash, suffix with event snippet for uniqueness guarantee
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }

@@ -340,9 +340,10 @@ func (i *IterationScopeNode) String() string {
 	return ""
 }
 
-// BuildBlockNode represents a BUILD block with composition operations.
+// BuildBlockNode represents a BUILD block with composition operations and optional nested coordinates.
 type BuildBlockNode struct {
-	Operations []CompositionOpNode
+	Operations        []CompositionOpNode
+	NestedCoordinates []*CoordinateNode // nested COORDINATE blocks inside BUILD
 }
 
 func (b *BuildBlockNode) nodeType() string { return "build_block" }
@@ -561,6 +562,7 @@ type CompositionOpNode struct {
 	LoopBody      []CompositionOpNode
 	MapVariable   string
 	Collection    interface{} // expression
+	NestedCoordinate *CoordinateNode // for nested COORDINATE operations
 	MapBody       []CompositionOpNode
 	Message       string
 	FailureAction *CompositionOpNode
