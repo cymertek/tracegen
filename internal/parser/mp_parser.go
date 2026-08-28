@@ -6,7 +6,6 @@ package parser
 
 import (
 	"fmt"
-	"os"
 	"strconv"
 	"strings"
 )
@@ -55,6 +54,7 @@ func (p *Parser) Parse() (*SchemaNode, error) {
 
 	// Parse rules and coordinate blocks until EOF or next SCHEMA
 	for !p.eof() && (p.current().Type != TOKEN_SCHEMA || p.peek(1).Type == TOKEN_EOF) {
+		
 		if p.match(TOKEN_ROOT) {
 			rule, err := p.parseRule(true)
 			if err != nil {
@@ -512,15 +512,24 @@ func (p *Parser) parseBuildBlock() (*BuildBlockNode, error) {
 	}
 
 	for !p.eof() && p.current().Type != TOKEN_RBRACE {
-		fmt.Fprintf(os.Stderr, "DEBUG parseBuildBlock loop: current=%v (%q)\n", p.current().Type, p.current().Value)
+			
+		// Handle nested COORDINATE blocks within BUILD
+		if p.match(TOKEN_COORDINATE) {
+			nestedCoord, err := p.parseCoordinateBlock()
+			if err != nil {
+				return build, fmt.Errorf("parsing nested coordinate in BUILD: %w", err)
+			}
+			build.NestedCoordinates = append(build.NestedCoordinates, nestedCoord)
+			continue
+		}
+		
 		op := p.currentCompositionOp()
 		if op != nil {
 			build.Operations = append(build.Operations, *op)
 		} else if p.match(TOKEN_ATTRIBUTES) {
 			p.parseAttributesInline(&RuleNode{BuildBlock: build})
 		} else {
-			fmt.Fprintf(os.Stderr, "DEBUG parseBuildBlock: skipping token %v (%q)\n", p.current().Type, p.current().Value)
-			p.advance() // skip unknown token in BUILD block
+					p.advance() // skip unknown token in BUILD block
 		}
 	}
 
@@ -582,12 +591,27 @@ func (p *Parser) parseAttributesInline(rule *RuleNode) {
 	p.expect(TOKEN_RBRACE)
 }
 
-// parseCoordinateBlock parses a COORDINATE block.
+// parseCoordinateBlock parses a COORDINATE block with threads and DO...OD operations.
 func (p *Parser) parseCoordinateBlock() (*CoordinateNode, error) {
 	coord := &CoordinateNode{}
 
-	if !p.expect(TOKEN_COORDINATE) {
-		return coord, p.errorf("expected 'COORDINATE' keyword")
+	// Optionally consume COORDINATE keyword - caller may have already matched it
+	// (e.g., when called from parseBuildBlock after p.match(TOKEN_COORDINATE))
+	p.match(TOKEN_COORDINATE)
+
+	// Parse optional modifiers like <REVERSE> that can appear after COORDINATE
+	for !p.eof() && p.current().Type == TOKEN_LESS {
+		p.advance() // skip '<'
+		if p.current().Value == "REVERSE" || (p.current().Type == TOKEN_CNAME) {
+			modifier := p.current().Value
+			coord.Modifiers = append(coord.Modifiers, modifier)
+			p.advance() // skip modifier name
+			if !p.match(TOKEN_GREATER) {
+				return coord, p.errorf("expected '>' after modifier")
+			}
+		} else {
+			p.advance() // skip unknown token after '<'
+		}
 	}
 
 	// Parse thread declarations: $x: send FROM Sender, ...
@@ -628,19 +652,63 @@ func (p *Parser) parseCoordinateBlock() (*CoordinateNode, error) {
 
 	coord.Threads = threads
 
-	// Parse DO ... OD block
+	// Skip optional SUCH/THAT condition between threads and DO (for nested coords like Example04)
+	for !p.eof() && (p.current().Value == "SUCH" || p.current().Value == "THAT") {
+		p.advance() // skip SUCH or THAT keyword
+	}
+
+	// Parse DO ... OD block (may contain nested coordinates)
 	if p.match(TOKEN_DO) {
-		for !p.eof() && !p.match(TOKEN_OD) {
+		for !p.eof() {
+			// Check for composition operations first
 			op := p.currentCompositionOp()
 			if op != nil {
 				coord.Operations = append(coord.Operations, *op)
-			} else {
-				p.advance() // skip unknown token in DO block
+				continue
 			}
+
+			// Check for nested COORDINATE inside this DO...OD
+			if p.current().Type == TOKEN_COORDINATE {
+				nestedCoord, err := p.parseCoordinateBlock()
+				if err != nil {
+					return coord, fmt.Errorf("parsing nested coordinate: %w", err)
+				}
+				coord.NestedCoords = append(coord.NestedCoords, nestedCoord)
+				continue
+			}
+
+			// Check for closing OD at this level
+			if p.match(TOKEN_OD) {
+				break // consumed the matching OD - done with DO...OD
+			}
+
+			// Skip any other tokens (SUCH THAT, IF/THEN/FI, control flow keywords)
+			p.advance()
+		}
+		// After DO...OD, skip optional semicolons between OD and next coord/thread
+		for p.match(TOKEN_SEMICOLON) {
 		}
 	}
 
 	return coord, nil
+}
+
+// isSkipToken checks if a token should be skipped in DO...OD blocks
+// (such as IF, THEN, FI, NOT, OR, AND, EXISTS, SUCH, THAT, etc.)
+func isSkipToken(t Token) bool {
+	val := strings.ToUpper(t.Value)
+	switch t.Type {
+	case TOKEN_IF, TOKEN_THEN, TOKEN_ELSE, TOKEN_FI:
+		return true
+	case TOKEN_NOT, TOKEN_AND, TOKEN_OR:
+		return true
+	default:
+		switch val {
+		case "SUCH", "THAT", "EXISTS":
+			return true
+		}
+		return false
+	}
 }
 
 // currentCompositionOp returns the next composition operation or nil if none.
@@ -699,37 +767,30 @@ func (p *Parser) currentCompositionOp() *CompositionOpNode {
 	}
 
 	if current.Type == TOKEN_IF {
-		fmt.Fprintf(os.Stderr, "DEBUG currentCompositionOp: parsing IF block\n")
-		p.advance() // skip IF
+			p.advance() // skip IF
 
 		expr, err := p.parseBooleanExpression()
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "DEBUG parseBooleanExpression failed: %v\n", err)
-			return nil
+					return nil
 		}
 
-		fmt.Fprintf(os.Stderr, "DEBUG IF condition parsed, next token=%v (%q)\n", p.current().Type, p.current().Value)
-		fmt.Fprintf(os.Stderr, "DEBUG   expr type: %T\n", expr)
-
+		
 		op := &CompositionOpNode{
 			Type:      "IF_THEN_ELSE",
 			Condition: expr,
 		}
 
 		if !p.expect(TOKEN_THEN) {
-			fmt.Fprintf(os.Stderr, "DEBUG currentCompositionOp: no THEN after IF condition\n")
-			return op
+					return op
 		}
 
 		var thenOps []CompositionOpNode
 		for !p.eof() && (p.current().Type != TOKEN_ELSE && p.current().Type != TOKEN_FI) {
-			fmt.Fprintf(os.Stderr, "DEBUG IF body: current=%v (%q)\n", p.current().Type, p.current().Value)
-			subOp := p.currentCompositionOp()
+					subOp := p.currentCompositionOp()
 			if subOp != nil {
 				thenOps = append(thenOps, *subOp)
 			} else {
-				fmt.Fprintf(os.Stderr, "DEBUG IF body: advancing past %v (%q)\n", p.current().Type, p.current().Value)
-				p.advance()
+							p.advance()
 			}
 		}
 		op.ThenBranch = thenOps
@@ -938,7 +999,6 @@ func (p *Parser) parseBooleanExpression() (BoolExprNode, error) {
 		return p.parseQuantifiedExpression()
 	}
 
-	fmt.Fprintf(os.Stderr, "DEBUG parseBooleanExpression: current=%v (%q)\n", p.current().Type, p.current().Value)
 
 	left, err := p.parseComparisonExpression()
 	if err != nil {
@@ -1037,13 +1097,11 @@ func (p *Parser) parseComparisonExpression() (BoolExprNode, error) {
 	}
 
 	current := p.current()
-	fmt.Fprintf(os.Stderr, "DEBUG parseComparisonExpression: after primary, current=%v (%q)\n", current.Type, current.Value)
 
 	// Check for comparison operators first: ==, !=, <, <=, >, >=
 	switch current.Type {
 	case TOKEN_EQUALS, TOKEN_NOT_EQUAL, TOKEN_LESS, TOKEN_LESS_EQ, TOKEN_GREATER, TOKEN_GREATER_EQ:
-		fmt.Fprintf(os.Stderr, "DEBUG parseComparisonExpression: consuming %s\n", comparisonOpName(current.Type))
-		p.advance() // consume the operator
+			p.advance() // consume the operator
 		right, err := p.parseNumericExpression()
 		if err != nil {
 			return nil, err
@@ -1051,8 +1109,7 @@ func (p *Parser) parseComparisonExpression() (BoolExprNode, error) {
 
 		leftNode := toNumExpr(left)
 		rightNode := toNumExpr(right)
-		fmt.Fprintf(os.Stderr, "DEBUG parseComparisonExpression: parsed comparison %v %s %v\n", left, comparisonOpName(current.Type), right)
-
+	
 		return &BoolNumericCompareNode{
 			Left:     leftNode,
 			Operator: comparisonOpName(current.Type),
@@ -1253,15 +1310,13 @@ func (p *Parser) parsePrimaryExpression() (ASTNode, error) {
 			p.advance()
 
 			expr := &CountExpr{EventName: eventName}
-			fmt.Fprintf(os.Stderr, "DEBUG parsePrimaryExpression: parsed count #%s\n", eventName)
-			// Check for optional scope filter: FROM source
+					// Check for optional scope filter: FROM source
 			if p.isScopeFilter() {
 				p.advance() // consume FROM
 				fromToken := p.current()
 				if fromToken.Type == TOKEN_CNAME {
 					expr.Scope = &EventInstanceNode{Name: fromToken.Value}
-					fmt.Fprintf(os.Stderr, "DEBUG parsePrimaryExpression: scope filter %s\n", fromToken.Value)
-					p.advance()
+									p.advance()
 				}
 			}
 

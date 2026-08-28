@@ -5,6 +5,7 @@
 package parser
 
 import (
+	"os"
 	"fmt"
 	"strings"
 )
@@ -176,6 +177,7 @@ func (l *Lexer) Tokenize() ([]Token, error) {
 }
 
 func (l *Lexer) nextToken() (Token, error) {
+
 	ch := l.currentChar()
 
 	switch {
@@ -309,8 +311,9 @@ func (l *Lexer) nextToken() (Token, error) {
 				return Token{Type: TOKEN_INTERVAL_START, Value: "<", Line: l.line, Column: l.column}, nil
 			}
 		}
-		// Otherwise treat as comparison operator
-		l.pos-- // back up to include '<' in the less-than token
+		// Otherwise treat as comparison operator (less-than)
+		l.advance() // advance past '<'
+		os.Stderr.Sync()
 		return Token{Type: TOKEN_LESS, Value: "<", Line: l.line, Column: l.column}, nil
 	case ch == '/':
 		if l.peek(1) == '*' {

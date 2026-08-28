@@ -30,21 +30,24 @@ func (g *CPUGenerator) GenerateTracesToSQLite(schema *parser.SchemaNode, scope i
 
 	// Collect all coordinates: top-level schema coordinates + nested from BUILD blocks
 	allCoordinates := make([]*parser.CoordinateNode, 0, len(schema.Coordinates))
-	
+
 	// Add top-level coordinates first
 	for _, coord := range schema.Coordinates {
 		if coord != nil && len(coord.Threads) > 0 {
 			allCoordinates = append(allCoordinates, coord)
 		}
 	}
-	
+
 	// Add nested coordinates from BUILD blocks in rules
 	for i := range schema.Rules {
 		rule := &schema.Rules[i]
 		if rule.BuildBlock != nil && len(rule.BuildBlock.NestedCoordinates) > 0 {
-			allCoordinates = append(allCoordinates, rule.BuildBlock.NestedCoordinates...)
+			for _, nc := range rule.BuildBlock.NestedCoordinates {
+				allCoordinates = append(allCoordinates, nc)
+			}
 		}
 	}
+
 
 	// Process coordinates sequentially to minimize memory usage
 	for _, coord := range schema.Coordinates {
@@ -52,7 +55,6 @@ func (g *CPUGenerator) GenerateTracesToSQLite(schema *parser.SchemaNode, scope i
 			continue
 		}
 
-		fmt.Printf("[DEBUG] Processing coordinate with %d threads:\n", len(coord.Threads))
 		for i, thread := range coord.Threads {
 			fmt.Printf("  Thread %d: EventName=%q From=%v\n", i, thread.EventName, thread.From)
 		}

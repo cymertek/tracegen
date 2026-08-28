@@ -5,6 +5,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"flag"
@@ -24,6 +25,7 @@ import (
 const version = "1.0.0"
 
 func main() {
+	os.Stdout.Sync()
 	if len(os.Args) < 2 {
 		printUsage()
 		os.Exit(1)
@@ -32,13 +34,18 @@ func main() {
 	command := os.Args[1]
 	args := os.Args[2:]
 
+	
+	os.Stdout.Sync()
 	switch command {
 	case "eval", "trace":
 		evalCommand(args)
 	case "count":
 		countCommand(args)
 	case "summary":
+	case "parse":
+		parseCommand(args)
 		summaryCommand(args)
+		parseCommand(args)
 	case "version", "--version", "-V":
 		fmt.Printf("tgeval v%s\n", version)
 	case "help", "--help", "-h":
@@ -319,7 +326,6 @@ func evaluate(mpFile string, scope int, outputPath string, quiet bool, verbose b
 
 // traceCount parses an MP file and returns the number of unique trace segments using SQLite dedup.
 func traceCount(mpFile string, scope int) (int64, error) {
-	fmt.Printf("[TRACE] Starting traceCount for %s scope=%d\n", mpFile, scope)
 	input, err := os.ReadFile(mpFile)
 	if err != nil {
 		return 0, fmt.Errorf("reading %s: %w", mpFile, err)
@@ -557,5 +563,77 @@ func startProgressReporter(totalTraces int64, flushFn func()) func(int64) {
 
 	return func(count int64) {
 		currentCount.Store(count)
+	}
+}
+
+// parseCommand handles "tgeval parse <file.mp>" - just validates parsing without generating traces.
+
+// parseCommand handles "tgeval parse <file.mp>" - validates parsing without generating traces.
+
+// parseCommand handles "tgeval parse <file.mp>" - validates parsing without generating traces.
+func parseCommand(args []string) {
+	fmt.Println("=== PARSE COMMAND START ===")
+	os.Stdout.Sync()
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "Error: parse command requires at least one .mp file")
+		os.Exit(1)
+	}
+
+	parseIter := 0
+	for i, mpFile := range args {
+		parseIter++
+		fmt.Printf("[Parse iter %d]\n", parseIter)
+		os.Stdout.Sync()
+		fmt.Printf("[%d] Parsing: %s\n", i+1, mpFile)
+		os.Stdout.Sync()
+		
+		// Use context with timeout to prevent infinite loops
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		
+		errCh := make(chan error, 1)
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					errCh <- fmt.Errorf("panic in parser: %v", r)
+				}
+			}()
+			input, err := os.ReadFile(mpFile)
+			if err != nil {
+				errCh <- fmt.Errorf("reading %s: %w", mpFile, err)
+				return
+			}
+
+			tokens, err := parser.NewLexer(string(input)).Tokenize()
+			if err != nil {
+				errCh <- fmt.Errorf("tokenizing %s: %w", mpFile, err)
+				return
+			}
+
+			schemaNode, err := parser.NewParser(tokens).Parse()
+			if err != nil {
+				errCh <- fmt.Errorf("parsing %s: %v", mpFile, err)
+				return
+			}
+
+			// Print nested coordinates info if any
+			for _, rule := range schemaNode.Rules {
+				if rule.BuildBlock != nil && len(rule.BuildBlock.NestedCoordinates) > 0 {
+					fmt.Printf("  Rule %q has %d nested coordinates in BUILD block\n", 
+						rule.Name, len(rule.BuildBlock.NestedCoordinates))
+				}
+			}
+			
+			errCh <- nil
+		}()
+		
+		select {
+		case err := <-errCh:
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error parsing %s: %v\n", mpFile, err)
+			}
+		case <-ctx.Done():
+			fmt.Fprintf(os.Stderr, "Timeout parsing %s - possible infinite loop\n", mpFile)
+		}
 	}
 }

@@ -518,6 +518,8 @@ func (g *GraphOperationNode) nodeType() string { return "graph_operation" }
 
 // CoordinateNode represents a COORDINATE block with threads and DO/OD.
 type CoordinateNode struct {
+	NestedCoords   []*CoordinateNode // nested coordinates within DO blocks
+	Modifiers      []string          // e.g., "REVERSE" for <REVERSE> modifier
 	Threads    []ThreadSelectionNode
 	Operations []CompositionOpNode
 }
