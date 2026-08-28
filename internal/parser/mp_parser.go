@@ -1356,24 +1356,50 @@ func (p *Parser) parsePrimaryExpression() (ASTNode, error) {
 
 	if current.Type == TOKEN_VARIABLE || current.Type == TOKEN_NODE_VARIABLE || current.Type == TOKEN_NUMERIC_VARIABLE {
 		varName := ""
+		isNodeVar := false
 		switch current.Type {
 		case TOKEN_VARIABLE:
 			varName = current.Value[1:]
 		case TOKEN_NODE_VARIABLE:
 			varName = current.Value[5:]
+			isNodeVar = true
 		case TOKEN_NUMERIC_VARIABLE:
 			varName = current.Value[4:]
 		}
 		p.advance()
 
-		expr := &VarRefExpr{Value: varName}
+		// Check for attribute access: $var.attr or Node$var.attr
+		if !p.eof() && p.current().Type == TOKEN_DOT {
+			p.advance() // skip '.'
+			if p.current().Type == TOKEN_CNAME || p.current().Type == TOKEN_VARIABLE {
+				attrName := p.current().Value
+				p.advance()
+
+				// Create attribute reference expression
+				return &AttrRefExprNode{
+					Variable:  varName,
+					IsNodeVar: isNodeVar,
+					Attribute: attrName,
+				}, nil
+			}
+			// Reset if not a valid attribute name
+			p.pos -= 2 // back up past '.' and current token
+		}
+
+		expr := &VarRefExpr{Value: varName, IsNodeVar: isNodeVar}
 		// Check for optional scope filter: FROM source
 		if p.isScopeFilter() {
 			p.advance() // consume FROM
 			fromToken := p.current()
-			if fromToken.Type == TOKEN_CNAME {
-				expr.Scope = &EventInstanceNode{Name: fromToken.Value}
+			if fromToken.Type == TOKEN_CNAME || fromToken.Type == TOKEN_VARIABLE {
+				fromVar := ""
+				if fromToken.Type == TOKEN_CNAME {
+					fromVar = fromToken.Value
+				} else {
+					fromVar = fromToken.Value[1:] // strip $
+				}
 				p.advance()
+				expr.Scope = &EventInstanceNode{Name: fromVar}
 			}
 		}
 		return expr, nil
