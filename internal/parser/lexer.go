@@ -191,6 +191,12 @@ func (l *Lexer) nextToken() (Token, error) {
 		return l.scanString()
 	case ch == '$':
 		l.advance()
+		// Check for double-dollar global variables like $$ROOT, $$scope, $$TP, etc.
+		if l.pos < len(l.input) && l.currentChar() == '$' {
+			l.advance() // skip second $
+			name := l.scanIdentifierBody()
+			return Token{Type: TOKEN_VARIABLE, Value: "$$" + name, Line: l.line, Column: l.column}, nil
+		}
 		if l.pos < len(l.input) && (isLetter(l.currentChar()) || l.currentChar() == '_') {
 			name := l.scanIdentifierBody()
 			return Token{Type: TOKEN_VARIABLE, Value: "$" + name, Line: l.line, Column: l.column}, nil

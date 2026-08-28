@@ -340,10 +340,27 @@ func (i *IterationScopeNode) String() string {
 	return ""
 }
 
-// BuildBlockNode represents a BUILD block with composition operations and optional nested coordinates.
+// StatementNode is the interface for statements within BUILD blocks.
+type StatementNode interface {
+	ASTNode
+	statementNodeType() string
+}
+
+// AssignmentStatement represents a variable assignment: varName := expr or $var.attr := expr
+type AssignmentStatement struct {
+	Target    AttrExprNode // left-hand side (variable name, attribute reference)
+	Value     NumericExpressionNode // right-hand side numeric expression
+	Operator  string       // assignment operator: "=", ":=", "+=", etc.
+}
+
+func (a *AssignmentStatement) nodeType() string          { return "assignment" }
+func (a *AssignmentStatement) statementNodeType() string { return "ASSIGNMENT" }
+
+// BuildBlockNode represents a BUILD block with composition operations, nested coordinates, and statements.
 type BuildBlockNode struct {
 	Operations        []CompositionOpNode
 	NestedCoordinates []*CoordinateNode // nested COORDINATE blocks inside BUILD
+	Statements        []StatementNode   // assignment and other statements
 }
 
 func (b *BuildBlockNode) nodeType() string { return "build_block" }
@@ -464,8 +481,10 @@ func (p *ProbabilityNode) nodeType() string { return "probability" }
 
 // IterationScopeNode defines bounds for iterations: <min..max>.
 type IterationScopeNode struct {
-	Min int
-	Max int // -1 means unbounded
+	Min        int
+	Max        int // -1 means unbounded
+	MinVarName string // variable name for dynamic lower bound (e.g., "$$scope")
+	MaxVarName string // variable name for dynamic upper bound
 }
 
 func (i *IterationScopeNode) nodeType() string { return "iteration_scope" }
@@ -795,8 +814,10 @@ func (c *CountExpr) boolExprType() string { return "NUM_AS_BOOL" } // count can 
 
 // VarRefExpr represents a variable reference ($x, Node$x).
 type VarRefExpr struct {
-	Value string             // variable name without $ prefix
-	Scope *EventInstanceNode // optional FROM clause for scope filtering
+	Value        string             // variable name without $ prefix
+	IsNodeVar    bool               // true if it's a Node$ variable
+	IsDoubleDollar bool             // true if it's a $$global variable like $$scope
+	Scope        *EventInstanceNode // optional FROM clause for scope filtering
 }
 
 func (v *VarRefExpr) nodeType() string     { return "var_ref" }
@@ -961,6 +982,25 @@ type IntervalAttrExprNode struct {
 
 func (i *IntervalAttrExprNode) nodeType() string { return "interval_attr_expr" }
 func (i *IntervalAttrExprNode) attrType() string { return "INTERVAL" }
+
+// AttrRefExprNode represents an attribute reference like $var.attr or Node$var.attr
+type AttrRefExprNode struct {
+	Variable  string // variable name without prefix
+	IsNodeVar bool   // true if it's a Node$ variable
+	Attribute string // attribute name after the dot
+}
+
+func (a *AttrRefExprNode) nodeType() string { return "attr_ref" }
+func (a *AttrRefExprNode) attrType() string { return "ATTR_REF" }
+
+// VarRefAttrExprNode represents a simple variable reference as an attribute expression
+type VarRefAttrExprNode struct {
+	Name      string // variable name without prefix
+	IsNodeVar bool   // true if it's a Node$ variable
+}
+
+func (v *VarRefAttrExprNode) nodeType() string { return "var_ref_attr" }
+func (v *VarRefAttrExprNode) attrType() string { return "VARIABLE" }
 
 // AttrOpNode represents compound assignment operators: :=, +=, -=, *=, /=, MIN=, MAX=.
 type AttrOpNode string
