@@ -485,6 +485,20 @@ func (p *Parser) isPlusAssign() bool {
 	return false
 }
 
+// isKeywordLike checks if a token value looks like an MP keyword (case-insensitive)
+func isKeywordLike(value string) bool {
+	val := strings.ToUpper(value)
+	switch val {
+	case "ROOT", "COORDINATE", "DO", "OD", "IF", "THEN", "ELSE", "FI",
+		 "ADD", "ENSURE", "CHECK", "MARK", "BUILD", "SCHEMA", "FROM",
+		 "SHARE", "SUCH", "THAT", "NOT", "OR", "AND", "TRUE", "FALSE",
+		 "EXISTS", "FOREACH", "TO", "AT", "LEAST":
+		return true
+	default:
+		return false
+	}
+}
+
 // parseProbabilityAnnotation handles <<value>> or .digits probability annotations.
 func (p *Parser) parseProbabilityAnnotation() *ProbabilityNode {
 	current := p.current()
@@ -964,6 +978,7 @@ func (p *Parser) currentCompositionOp() *CompositionOpNode {
 		p.advance() // skip SET
 
 		variable := ""
+		// Handle both $variable and plain identifier (like "duration")
 		if p.current().Type == TOKEN_VARIABLE || p.current().Type == TOKEN_NODE_VARIABLE {
 			if p.current().Type == TOKEN_VARIABLE {
 				variable = p.current().Value[1:]
@@ -971,22 +986,36 @@ func (p *Parser) currentCompositionOp() *CompositionOpNode {
 				variable = p.current().Value[5:]
 			}
 			p.advance()
+		} else if p.current().Type == TOKEN_CNAME && !isKeywordLike(p.current().Value) {
+			variable = p.current().Value
+			p.advance()
 		}
 
-		if !p.expect(TOKEN_TO) {
-			return nil
+		if variable == "" {
+			return nil // return nil on error (caller will handle)
+		}
+
+		// Handle different assignment syntaxes: TO expr, AT expr, AT LEAST expr
+		if !p.match(TOKEN_TO) && !p.match(TOKEN_AT) {
+			return nil // return nil if no valid keyword found
+		}
+
+		// Check for optional LEAST keyword (AT LEAST syntax)
+		if p.current().Value == "LEAST" {
+			p.advance() // skip LEAST
 		}
 
 		expr, err := p.parseExpression()
 		if err != nil {
-			return nil
+			return nil // return nil on expression parse error
 		}
 
-		return &CompositionOpNode{
+		op := &CompositionOpNode{
 			Type:       "SET",
 			Variable:   variable,
 			Expression: expr,
 		}
+		return op
 	}
 
 	return nil
