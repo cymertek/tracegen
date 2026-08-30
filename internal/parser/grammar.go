@@ -36,6 +36,7 @@ type SchemaNode struct {
 	Attributes       []AttributeDeclarationNode
 	ViewDescriptions []ViewDescriptionNode
 	Coordinates      []*CoordinateNode
+	Statements       []StatementNode // top-level assignment statements
 }
 
 func (s *SchemaNode) nodeType() string { return "schema" }
@@ -747,6 +748,15 @@ type BoolNumericCompareNode struct {
 
 func (b *BoolNumericCompareNode) nodeType() string     { return "bool_numeric_compare" }
 func (b *BoolNumericCompareNode) boolExprType() string { return "NUMERIC_COMPARE" }
+
+// BoolIsNode represents a type check: event_var IS event_name.
+type BoolIsNode struct {
+	EventVar  ASTNode // left operand (variable reference)
+	EventName string  // right operand (event name to match against)
+}
+
+func (b *BoolIsNode) nodeType() string     { return "bool_is" }
+func (b *BoolIsNode) boolExprType() string { return "IS_TYPE_CHECK" }
 
 // BoolMayOverlapNode is MAY_OVERLAP variable variable.
 type BoolMayOverlapNode struct {

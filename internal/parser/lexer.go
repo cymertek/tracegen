@@ -127,6 +127,7 @@ const (
 	TOKEN_THIS            // THIS keyword
 	TOKEN_HASH            // # count operator
 	TOKEN_ITERATION_START // (* - start of iteration pattern
+	TOKEN_IS              // IS keyword for type checking ($e IS pop)
 )
 
 // Token represents a single lexical token.
@@ -326,9 +327,9 @@ func (l *Lexer) nextToken() (Token, error) {
 		l.advance()
 		return Token{Type: TOKEN_DIVIDE, Value: "/", Line: l.line, Column: l.column}, nil
 	case ch == '>':
-		if l.peek(1) == '>' {
+		if l.peek(1) == '=' {
 			l.advanceN(2)
-			return Token{Type: TOKEN_GREATER_EQ, Value: ">>", Line: l.line, Column: l.column}, nil
+			return Token{Type: TOKEN_GREATER_EQ, Value: ">=", Line: l.line, Column: l.column}, nil
 		}
 		l.advance()
 		return Token{Type: TOKEN_GREATER, Value: ">", Line: l.line, Column: l.column}, nil
@@ -684,6 +685,8 @@ func (l *Lexer) lookupKeyword(value string) TokenType {
 		return TOKEN_THIS
 	case "NOT":
 		return TOKEN_NOT
+	case "IS":
+		return TOKEN_IS
 	case "AND":
 		return TOKEN_AND
 	case "OR":

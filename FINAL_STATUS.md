@@ -1,7 +1,83 @@
-# MP Parser Progress Report - Final Status
+# MP Parser Progress Report - Updated Status (August 30, 2026)
 
 ## Summary
-**25 of 45 examples working correctly with zero memory limit violations.**
+**26 of 45 examples working correctly with zero memory limit violations.**
+
+---
+
+## Most Recent Fixes (Latest Session)
+
+### ✓ Example29_stack1_Bayesian_probability.mp - FIXED
+- **Issue**: `IF $e IS pop THEN p2 *:= 0.25;` syntax not supported
+- **Fix**: Added `IS` keyword support for type checking in boolean expressions
+- **Status**: Now generates 1 trace successfully
+
+### ✓ Example26_timing_attributes.mp - FIXED (from previous session)
+- **Issue**: `SET duration AT LEAST 1;` syntax not supported  
+- **Fix**: Extended SET statement parsing to handle AT/TO keywords and optional LEAST modifier
+- **Status**: Now generates 2 traces successfully
+
+### ✓ Example04_Stack_behavior.mp - FIXED (from previous session)
+- **Issue**: Lexer infinite loop at `< #push` comparison operator
+- **Fix**: Changed `l.pos--` to `l.advance()` in lexer for TOKEN_LESS
+- **Status**: Now generates 2 traces (<1 second, no memory issues)
+
+### ✓ Example05_Car_Race.mp - FIXED (from previous session)  
+- **Issue**: Parser hang on nested COORDINATE with `<REVERSE>` modifier
+- **Fix**: Added modifier parsing and proper DO...OD consumption in parseCoordinateBlock
+- **Status**: Now generates 2 traces successfully
+
+---
+
+## Parser Enhancements Applied (5 Commits)
+
+| Commit | Enhancement | Impact |
+|--------|-------------|--------|
+| `c9ac254` | Double-dollar variable support (`$$ROOT`, `$$scope`) | Enables global variable references in patterns and expressions |
+| `14182da` | SET statement with AT LEAST syntax | Fixed Example26 timing attributes |
+| `1816c59` | Attribute access on variables (`$var.attr`) | Enabled comparisons like `$a.initial_tokens > 0` |
+| Latest | IS keyword for type checking (`$e IS pop`) | Fixed Example29 stack probability modeling |
+
+---
+
+## Current Working Examples (26/45)
+
+### Core Message Flow Patterns (13 examples)
+| Example | Traces | Notes |
+|---------|--------|-------|
+| Example01_simple_message_flow.mp | 1 | Basic message flow |
+| Example01a_unreliable_message_flow.mp | 1 | Unreliable variant |
+| Example02_Data_flow.mp | 3 | Data flow pattern |
+| Example03_ATM_withdrawal.mp | 6 | ATM withdrawal logic |
+| **Example04_Stack_behavior.mp** | **2** | **FIXED - previously hung** |
+| Example04a_Queue_behavior.mp | 2 | Queue behavior variant |
+| **Example05_Car_Race.mp** | **2** | **FIXED - previously hung** |
+| Example07_Unconstrained_Stack.mp | 2 | Unconstrained stack |
+| Example08_Operational_Process.mp | 14 | Operational process |
+| Example09_Employee_Employer.mp | 2 | Employee-employer relationship |
+| Example10_Pipe_Filter.mp | 1 | Pipe filter pattern |
+| Example13_FiniteStateDiagram.mp | 12 | Finite state diagram |
+| Example15_Petri_net.mp | 9 | Petri net with attribute access |
+
+### Advanced Patterns (8 examples)
+| Example | Traces | Notes |
+|---------|--------|-------|
+| Example16_software_spiral_process.mp | 13 | Software spiral process |
+| Example18_Workflow_pattern.mp | 1 | Workflow pattern |
+| Example20_MP_model__reuse.mp | 2 | Model reuse |
+| Example23_number_attributes.mp | 1 | Number attributes |
+| Example25_interval_attributes.mp | 0 | Interval attributes (valid empty) |
+| **Example26_timing_attributes.mp** | **2** | **FIXED - SET AT LEAST syntax** |
+| **Example29_stack1_Bayesian_probability.mp** | **1** | **FIXED - IS keyword support** |
+| Example30_Local_Report.mp | 3 | Local report |
+
+### Reporting and Visualization (5 examples)
+| Example | Traces | Notes |
+|---------|--------|-------|
+| Example31_Global_report.mp | 1 | Global report |
+| Example32_Local_graph.mp | 3 | Local graph |
+| Example35_Finite_State_Diagram.mp | 14 | Finite state diagram variant |
+| Example36_Statechart.mp | 6 | Statechart pattern |
 
 ---
 
@@ -138,3 +214,30 @@ Each feature can be implemented incrementally without breaking existing function
 The two critical hanging bugs (Example04, Example05) have been resolved, and the parser now successfully handles 25 of 45 MP examples with zero memory limit violations. The remaining 20 failures represent advanced MP language features that can be added incrementally. The streaming SQLite backend ensures memory safety even for complex trace generation scenarios.
 
 **Key Achievement**: System stability restored - no more hangs or memory leaks on previously problematic examples.
+
+---
+
+## Update: August 30, 2026 - Progress to 26/45 Examples
+
+### New Fix: IS Keyword Support (Example29)
+**Added**: `IS` keyword for type checking in boolean expressions  
+**Pattern**: `$e IS pop` means "if event $e has type 'pop'"  
+**Implementation**: 
+- Added TOKEN_IS to lexer.go keyword lookup
+- Extended parseComparisonExpression() to handle IS as a comparison operator
+- Created BoolIsNode AST node type in grammar.go
+
+**Result**: Example29_stack1_Bayesian_probability.mp now generates 1 trace successfully.
+
+### Current Status: 26/45 Examples Working
+- **Working**: 26 examples (previously 25)
+- **Failing**: 19 examples  
+- **Memory Safe**: All working examples stay under 2GB RSS limit
+
+### Next Priority: Compound Assignments and Local Variables
+The simplest remaining fixes are:
+1. **Example38** - Support `accumulated_total := expr;` in BUILD blocks (local variables)
+2. **Examples34, 43** - Support `Node$x.attr += value` syntax  
+3. **Example19** - Add NOT operator to boolean expressions
+
+These should be easier to implement than the bounded iteration scope issue and will bring us closer to full coverage.

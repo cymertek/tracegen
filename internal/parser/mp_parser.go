@@ -6,6 +6,7 @@ package parser
 
 import (
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 )
@@ -97,6 +98,9 @@ func (p *Parser) Parse() (*SchemaNode, error) {
 		} else if p.match(TOKEN_SHARE) {
 			// Top-level SHARE clause (e.g., "Employee, Employer SHARE ALL MedicalCheck, ReadyToWork;")
 			p.parseTopLevelShare(schema)
+		} else if stmt := tryParseTopLevelAssignment(p); stmt != nil {
+			// Top-level assignment statement: var := expr; or var += expr;
+			schema.Statements = append(schema.Statements, stmt)
 		} else {
 			p.advance() // skip unknown tokens
 		}
@@ -517,7 +521,7 @@ func (p *Parser) parseProbabilityAnnotation() *ProbabilityNode {
 	return &ProbabilityNode{Value: value}
 }
 
-// parseBuildBlock parses a BUILD block with composition operations.
+// parseBuildBlock parses a BUILD block with composition operations and statements.
 func (p *Parser) parseBuildBlock() (*BuildBlockNode, error) {
 	build := &BuildBlockNode{}
 
@@ -526,7 +530,7 @@ func (p *Parser) parseBuildBlock() (*BuildBlockNode, error) {
 	}
 
 	for !p.eof() && p.current().Type != TOKEN_RBRACE {
-			
+
 		// Handle nested COORDINATE blocks within BUILD
 		if p.match(TOKEN_COORDINATE) {
 			nestedCoord, err := p.parseCoordinateBlock()
@@ -536,7 +540,13 @@ func (p *Parser) parseBuildBlock() (*BuildBlockNode, error) {
 			build.NestedCoordinates = append(build.NestedCoordinates, nestedCoord)
 			continue
 		}
-		
+
+		// Handle assignment statements: var := expr; or var += expr; etc.
+		if stmt := p.tryParseAssignment(); stmt != nil {
+			build.Statements = append(build.Statements, stmt)
+			continue
+		}
+
 		op := p.currentCompositionOp()
 		if op != nil {
 			build.Operations = append(build.Operations, *op)
@@ -552,6 +562,74 @@ func (p *Parser) parseBuildBlock() (*BuildBlockNode, error) {
 	}
 
 	return build, nil
+}
+
+// tryParseAssignment attempts to parse an assignment statement (var := expr; or var += expr;)
+func (p *Parser) tryParseAssignment() StatementNode {
+	// Save position in case this isn't an assignment
+	savedPos := p.pos
+
+	// Check for variable name (CNAME, $variable, Node$variable)
+	if !isVariableStart(p.current()) {
+		p.pos = savedPos
+		return nil
+	}
+
+	var varName string
+	switch p.current().Type {
+	case TOKEN_CNAME:
+		varName = p.current().Value
+	case TOKEN_VARIABLE:
+		varName = p.current().Value[1:] // strip $
+	case TOKEN_NODE_VARIABLE:
+		varName = p.current().Value[5:] // strip Node$
+	default:
+		p.pos = savedPos
+		return nil
+	}
+	p.advance()
+
+	// Check for assignment operator
+	var opType string
+	switch {
+	case p.match(TOKEN_ASSIGN):
+		opType = ":="
+	case p.match(TOKEN_ADD_ASSIGN):
+		opType = "+="
+	case p.match(TOKEN_SUB_ASSIGN):
+		opType = "-="
+	case p.match(TOKEN_MUL_ASSIGN):
+		opType = "*="
+	case p.match(TOKEN_DIV_ASSIGN):
+		opType = "/="
+	default:
+		p.pos = savedPos
+		return nil
+	}
+
+	// Parse the right-hand side expression
+	expr, err := p.parseExpression()
+	if err != nil {
+		p.pos = savedPos
+		return nil
+	}
+
+	// Expect semicolon to complete the statement
+	if !p.match(TOKEN_SEMICOLON) {
+		p.pos = savedPos
+		return nil
+	}
+
+	return &AssignmentStatement{
+		Target:   &VarRefAttrExprNode{Name: varName},
+		Operator: opType,
+		Value:    expr,
+	}
+}
+
+// isVariableStart checks if a token can start a variable name in an assignment context
+func isVariableStart(t Token) bool {
+	return t.Type == TOKEN_CNAME || t.Type == TOKEN_VARIABLE || t.Type == TOKEN_NODE_VARIABLE
 }
 
 // parseAttributesInline parses inline ATTRIBUTES on a rule (not in BUILD).
@@ -1130,6 +1208,7 @@ func (p *Parser) parseComparisonExpression() (BoolExprNode, error) {
 	// Check for comparison operators first: ==, !=, <, <=, >, >=
 	switch current.Type {
 	case TOKEN_EQUALS, TOKEN_NOT_EQUAL, TOKEN_LESS, TOKEN_LESS_EQ, TOKEN_GREATER, TOKEN_GREATER_EQ:
+		fmt.Fprintf(os.Stderr, "[DEBUG] Comparison op: type=%v val=%q\n", p.current().Type, p.current().Value)
 			p.advance() // consume the operator
 		right, err := p.parseNumericExpression()
 		if err != nil {
@@ -1403,6 +1482,32 @@ func (p *Parser) parsePrimaryExpression() (ASTNode, error) {
 			}
 		}
 		return expr, nil
+	}
+
+	// Handle plain CNAME identifiers (like accumulated_total) and attribute access (GLOBAL.limit)
+	if current.Type == TOKEN_CNAME {
+		varName := p.current().Value
+		p.advance() // consume the identifier
+
+		// Check for attribute access: var.attr
+		if !p.eof() && p.current().Type == TOKEN_DOT {
+			p.advance() // skip '.'
+			if p.current().Type == TOKEN_CNAME || p.current().Type == TOKEN_VARIABLE {
+				attrName := p.current().Value
+				p.advance()
+
+				return &AttrRefExprNode{
+					Variable:  varName,
+					IsNodeVar: false,
+					Attribute: attrName,
+				}, nil
+			}
+			// Reset if not a valid attribute name
+			p.pos -= 2 // back up past '.' and current token
+		}
+
+		// Return as a simple variable reference
+		return &VarRefExpr{Value: varName, IsNodeVar: false}, nil
 	}
 
 	if current.Type == TOKEN_NUMBER_CONSTANT || current.Type == TOKEN_INTEGER_CONSTANT || current.Type == TOKEN_FLOAT_CONSTANT {
@@ -1794,5 +1899,68 @@ func isRelationName(name string) bool {
 		return true
 	default:
 		return false
+	}
+}
+
+// tryParseTopLevelAssignment attempts to parse a top-level assignment statement: var := expr; or var += expr;
+func tryParseTopLevelAssignment(p *Parser) StatementNode {
+	// Save position in case this isn't an assignment
+	savedPos := p.pos
+
+	// Check for variable name (CNAME, $variable, Node$variable)
+	if !isVariableStart(p.current()) {
+		p.pos = savedPos
+		return nil
+	}
+
+	var varName string
+	switch p.current().Type {
+	case TOKEN_CNAME:
+		varName = p.current().Value
+	case TOKEN_VARIABLE:
+		varName = p.current().Value[1:] // strip $
+	case TOKEN_NODE_VARIABLE:
+		varName = p.current().Value[5:] // strip Node$
+	default:
+		p.pos = savedPos
+		return nil
+	}
+	p.advance()
+
+	// Check for assignment operator
+	var opType string
+	switch {
+	case p.match(TOKEN_ASSIGN):
+		opType = ":="
+	case p.match(TOKEN_ADD_ASSIGN):
+		opType = "+="
+	case p.match(TOKEN_SUB_ASSIGN):
+		opType = "-="
+	case p.match(TOKEN_MUL_ASSIGN):
+		opType = "*="
+	case p.match(TOKEN_DIV_ASSIGN):
+		opType = "/="
+	default:
+		p.pos = savedPos
+		return nil
+	}
+
+	// Parse the right-hand side expression
+	expr, err := p.parseExpression()
+	if err != nil {
+		p.pos = savedPos
+		return nil
+	}
+
+	// Expect semicolon to complete the statement
+	if !p.match(TOKEN_SEMICOLON) {
+		p.pos = savedPos
+		return nil
+	}
+
+	return &AssignmentStatement{
+		Target:   &VarRefAttrExprNode{Name: varName},
+		Operator: opType,
+		Value:    expr,
 	}
 }
