@@ -127,7 +127,6 @@ const (
 	TOKEN_THIS            // THIS keyword
 	TOKEN_HASH            // # count operator
 	TOKEN_ITERATION_START // (* - start of iteration pattern
-	TOKEN_IS              // IS keyword for type checking ($e IS pop)
 )
 
 // Token represents a single lexical token.
@@ -177,7 +176,6 @@ func (l *Lexer) Tokenize() ([]Token, error) {
 }
 
 func (l *Lexer) nextToken() (Token, error) {
-
 	ch := l.currentChar()
 
 	switch {
@@ -191,12 +189,6 @@ func (l *Lexer) nextToken() (Token, error) {
 		return l.scanString()
 	case ch == '$':
 		l.advance()
-		// Check for double-dollar global variables like $$ROOT, $$scope, $$TP, etc.
-		if l.pos < len(l.input) && l.currentChar() == '$' {
-			l.advance() // skip second $
-			name := l.scanIdentifierBody()
-			return Token{Type: TOKEN_VARIABLE, Value: "$$" + name, Line: l.line, Column: l.column}, nil
-		}
 		if l.pos < len(l.input) && (isLetter(l.currentChar()) || l.currentChar() == '_') {
 			name := l.scanIdentifierBody()
 			return Token{Type: TOKEN_VARIABLE, Value: "$" + name, Line: l.line, Column: l.column}, nil
@@ -317,8 +309,8 @@ func (l *Lexer) nextToken() (Token, error) {
 				return Token{Type: TOKEN_INTERVAL_START, Value: "<", Line: l.line, Column: l.column}, nil
 			}
 		}
-		// Otherwise treat as comparison operator (less-than)
-		l.advance() // advance past '<'
+		// Otherwise treat as comparison operator
+		l.pos-- // back up to include '<' in the less-than token
 		return Token{Type: TOKEN_LESS, Value: "<", Line: l.line, Column: l.column}, nil
 	case ch == '/':
 		if l.peek(1) == '*' {
@@ -327,9 +319,9 @@ func (l *Lexer) nextToken() (Token, error) {
 		l.advance()
 		return Token{Type: TOKEN_DIVIDE, Value: "/", Line: l.line, Column: l.column}, nil
 	case ch == '>':
-		if l.peek(1) == '=' {
+		if l.peek(1) == '>' {
 			l.advanceN(2)
-			return Token{Type: TOKEN_GREATER_EQ, Value: ">=", Line: l.line, Column: l.column}, nil
+			return Token{Type: TOKEN_GREATER_EQ, Value: ">>", Line: l.line, Column: l.column}, nil
 		}
 		l.advance()
 		return Token{Type: TOKEN_GREATER, Value: ">", Line: l.line, Column: l.column}, nil
@@ -685,8 +677,6 @@ func (l *Lexer) lookupKeyword(value string) TokenType {
 		return TOKEN_THIS
 	case "NOT":
 		return TOKEN_NOT
-	case "IS":
-		return TOKEN_IS
 	case "AND":
 		return TOKEN_AND
 	case "OR":

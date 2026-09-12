@@ -55,7 +55,6 @@ func (p *Parser) Parse() (*SchemaNode, error) {
 
 	// Parse rules and coordinate blocks until EOF or next SCHEMA
 	for !p.eof() && (p.current().Type != TOKEN_SCHEMA || p.peek(1).Type == TOKEN_EOF) {
-		
 		if p.match(TOKEN_ROOT) {
 			rule, err := p.parseRule(true)
 			if err != nil {
@@ -98,9 +97,6 @@ func (p *Parser) Parse() (*SchemaNode, error) {
 		} else if p.match(TOKEN_SHARE) {
 			// Top-level SHARE clause (e.g., "Employee, Employer SHARE ALL MedicalCheck, ReadyToWork;")
 			p.parseTopLevelShare(schema)
-		} else if stmt := tryParseTopLevelAssignment(p); stmt != nil {
-			// Top-level assignment statement: var := expr; or var += expr;
-			schema.Statements = append(schema.Statements, stmt)
 		} else {
 			p.advance() // skip unknown tokens
 		}
@@ -489,20 +485,6 @@ func (p *Parser) isPlusAssign() bool {
 	return false
 }
 
-// isKeywordLike checks if a token value looks like an MP keyword (case-insensitive)
-func isKeywordLike(value string) bool {
-	val := strings.ToUpper(value)
-	switch val {
-	case "ROOT", "COORDINATE", "DO", "OD", "IF", "THEN", "ELSE", "FI",
-		 "ADD", "ENSURE", "CHECK", "MARK", "BUILD", "SCHEMA", "FROM",
-		 "SHARE", "SUCH", "THAT", "NOT", "OR", "AND", "TRUE", "FALSE",
-		 "EXISTS", "FOREACH", "TO", "AT", "LEAST":
-		return true
-	default:
-		return false
-	}
-}
-
 // parseProbabilityAnnotation handles <<value>> or .digits probability annotations.
 func (p *Parser) parseProbabilityAnnotation() *ProbabilityNode {
 	current := p.current()
@@ -521,7 +503,7 @@ func (p *Parser) parseProbabilityAnnotation() *ProbabilityNode {
 	return &ProbabilityNode{Value: value}
 }
 
-// parseBuildBlock parses a BUILD block with composition operations and statements.
+// parseBuildBlock parses a BUILD block with composition operations.
 func (p *Parser) parseBuildBlock() (*BuildBlockNode, error) {
 	build := &BuildBlockNode{}
 
@@ -530,30 +512,15 @@ func (p *Parser) parseBuildBlock() (*BuildBlockNode, error) {
 	}
 
 	for !p.eof() && p.current().Type != TOKEN_RBRACE {
-
-		// Handle nested COORDINATE blocks within BUILD
-		if p.match(TOKEN_COORDINATE) {
-			nestedCoord, err := p.parseCoordinateBlock()
-			if err != nil {
-				return build, fmt.Errorf("parsing nested coordinate in BUILD: %w", err)
-			}
-			build.NestedCoordinates = append(build.NestedCoordinates, nestedCoord)
-			continue
-		}
-
-		// Handle assignment statements: var := expr; or var += expr; etc.
-		if stmt := p.tryParseAssignment(); stmt != nil {
-			build.Statements = append(build.Statements, stmt)
-			continue
-		}
-
+		fmt.Fprintf(os.Stderr, "DEBUG parseBuildBlock loop: current=%v (%q)\n", p.current().Type, p.current().Value)
 		op := p.currentCompositionOp()
 		if op != nil {
 			build.Operations = append(build.Operations, *op)
 		} else if p.match(TOKEN_ATTRIBUTES) {
 			p.parseAttributesInline(&RuleNode{BuildBlock: build})
 		} else {
-					p.advance() // skip unknown token in BUILD block
+			fmt.Fprintf(os.Stderr, "DEBUG parseBuildBlock: skipping token %v (%q)\n", p.current().Type, p.current().Value)
+			p.advance() // skip unknown token in BUILD block
 		}
 	}
 
@@ -562,74 +529,6 @@ func (p *Parser) parseBuildBlock() (*BuildBlockNode, error) {
 	}
 
 	return build, nil
-}
-
-// tryParseAssignment attempts to parse an assignment statement (var := expr; or var += expr;)
-func (p *Parser) tryParseAssignment() StatementNode {
-	// Save position in case this isn't an assignment
-	savedPos := p.pos
-
-	// Check for variable name (CNAME, $variable, Node$variable)
-	if !isVariableStart(p.current()) {
-		p.pos = savedPos
-		return nil
-	}
-
-	var varName string
-	switch p.current().Type {
-	case TOKEN_CNAME:
-		varName = p.current().Value
-	case TOKEN_VARIABLE:
-		varName = p.current().Value[1:] // strip $
-	case TOKEN_NODE_VARIABLE:
-		varName = p.current().Value[5:] // strip Node$
-	default:
-		p.pos = savedPos
-		return nil
-	}
-	p.advance()
-
-	// Check for assignment operator
-	var opType string
-	switch {
-	case p.match(TOKEN_ASSIGN):
-		opType = ":="
-	case p.match(TOKEN_ADD_ASSIGN):
-		opType = "+="
-	case p.match(TOKEN_SUB_ASSIGN):
-		opType = "-="
-	case p.match(TOKEN_MUL_ASSIGN):
-		opType = "*="
-	case p.match(TOKEN_DIV_ASSIGN):
-		opType = "/="
-	default:
-		p.pos = savedPos
-		return nil
-	}
-
-	// Parse the right-hand side expression
-	expr, err := p.parseExpression()
-	if err != nil {
-		p.pos = savedPos
-		return nil
-	}
-
-	// Expect semicolon to complete the statement
-	if !p.match(TOKEN_SEMICOLON) {
-		p.pos = savedPos
-		return nil
-	}
-
-	return &AssignmentStatement{
-		Target:   &VarRefAttrExprNode{Name: varName},
-		Operator: opType,
-		Value:    expr,
-	}
-}
-
-// isVariableStart checks if a token can start a variable name in an assignment context
-func isVariableStart(t Token) bool {
-	return t.Type == TOKEN_CNAME || t.Type == TOKEN_VARIABLE || t.Type == TOKEN_NODE_VARIABLE
 }
 
 // parseAttributesInline parses inline ATTRIBUTES on a rule (not in BUILD).
@@ -683,27 +582,12 @@ func (p *Parser) parseAttributesInline(rule *RuleNode) {
 	p.expect(TOKEN_RBRACE)
 }
 
-// parseCoordinateBlock parses a COORDINATE block with threads and DO...OD operations.
+// parseCoordinateBlock parses a COORDINATE block.
 func (p *Parser) parseCoordinateBlock() (*CoordinateNode, error) {
 	coord := &CoordinateNode{}
 
-	// Optionally consume COORDINATE keyword - caller may have already matched it
-	// (e.g., when called from parseBuildBlock after p.match(TOKEN_COORDINATE))
-	p.match(TOKEN_COORDINATE)
-
-	// Parse optional modifiers like <REVERSE> that can appear after COORDINATE
-	for !p.eof() && p.current().Type == TOKEN_LESS {
-		p.advance() // skip '<'
-		if p.current().Value == "REVERSE" || (p.current().Type == TOKEN_CNAME) {
-			modifier := p.current().Value
-			coord.Modifiers = append(coord.Modifiers, modifier)
-			p.advance() // skip modifier name
-			if !p.match(TOKEN_GREATER) {
-				return coord, p.errorf("expected '>' after modifier")
-			}
-		} else {
-			p.advance() // skip unknown token after '<'
-		}
+	if !p.expect(TOKEN_COORDINATE) {
+		return coord, p.errorf("expected 'COORDINATE' keyword")
 	}
 
 	// Parse thread declarations: $x: send FROM Sender, ...
@@ -744,63 +628,19 @@ func (p *Parser) parseCoordinateBlock() (*CoordinateNode, error) {
 
 	coord.Threads = threads
 
-	// Skip optional SUCH/THAT condition between threads and DO (for nested coords like Example04)
-	for !p.eof() && (p.current().Value == "SUCH" || p.current().Value == "THAT") {
-		p.advance() // skip SUCH or THAT keyword
-	}
-
-	// Parse DO ... OD block (may contain nested coordinates)
+	// Parse DO ... OD block
 	if p.match(TOKEN_DO) {
-		for !p.eof() {
-			// Check for composition operations first
+		for !p.eof() && !p.match(TOKEN_OD) {
 			op := p.currentCompositionOp()
 			if op != nil {
 				coord.Operations = append(coord.Operations, *op)
-				continue
+			} else {
+				p.advance() // skip unknown token in DO block
 			}
-
-			// Check for nested COORDINATE inside this DO...OD
-			if p.current().Type == TOKEN_COORDINATE {
-				nestedCoord, err := p.parseCoordinateBlock()
-				if err != nil {
-					return coord, fmt.Errorf("parsing nested coordinate: %w", err)
-				}
-				coord.NestedCoords = append(coord.NestedCoords, nestedCoord)
-				continue
-			}
-
-			// Check for closing OD at this level
-			if p.match(TOKEN_OD) {
-				break // consumed the matching OD - done with DO...OD
-			}
-
-			// Skip any other tokens (SUCH THAT, IF/THEN/FI, control flow keywords)
-			p.advance()
-		}
-		// After DO...OD, skip optional semicolons between OD and next coord/thread
-		for p.match(TOKEN_SEMICOLON) {
 		}
 	}
 
 	return coord, nil
-}
-
-// isSkipToken checks if a token should be skipped in DO...OD blocks
-// (such as IF, THEN, FI, NOT, OR, AND, EXISTS, SUCH, THAT, etc.)
-func isSkipToken(t Token) bool {
-	val := strings.ToUpper(t.Value)
-	switch t.Type {
-	case TOKEN_IF, TOKEN_THEN, TOKEN_ELSE, TOKEN_FI:
-		return true
-	case TOKEN_NOT, TOKEN_AND, TOKEN_OR:
-		return true
-	default:
-		switch val {
-		case "SUCH", "THAT", "EXISTS":
-			return true
-		}
-		return false
-	}
 }
 
 // currentCompositionOp returns the next composition operation or nil if none.
@@ -859,30 +699,37 @@ func (p *Parser) currentCompositionOp() *CompositionOpNode {
 	}
 
 	if current.Type == TOKEN_IF {
-			p.advance() // skip IF
+		fmt.Fprintf(os.Stderr, "DEBUG currentCompositionOp: parsing IF block\n")
+		p.advance() // skip IF
 
 		expr, err := p.parseBooleanExpression()
 		if err != nil {
-					return nil
+			fmt.Fprintf(os.Stderr, "DEBUG parseBooleanExpression failed: %v\n", err)
+			return nil
 		}
 
-		
+		fmt.Fprintf(os.Stderr, "DEBUG IF condition parsed, next token=%v (%q)\n", p.current().Type, p.current().Value)
+		fmt.Fprintf(os.Stderr, "DEBUG   expr type: %T\n", expr)
+
 		op := &CompositionOpNode{
 			Type:      "IF_THEN_ELSE",
 			Condition: expr,
 		}
 
 		if !p.expect(TOKEN_THEN) {
-					return op
+			fmt.Fprintf(os.Stderr, "DEBUG currentCompositionOp: no THEN after IF condition\n")
+			return op
 		}
 
 		var thenOps []CompositionOpNode
 		for !p.eof() && (p.current().Type != TOKEN_ELSE && p.current().Type != TOKEN_FI) {
-					subOp := p.currentCompositionOp()
+			fmt.Fprintf(os.Stderr, "DEBUG IF body: current=%v (%q)\n", p.current().Type, p.current().Value)
+			subOp := p.currentCompositionOp()
 			if subOp != nil {
 				thenOps = append(thenOps, *subOp)
 			} else {
-							p.advance()
+				fmt.Fprintf(os.Stderr, "DEBUG IF body: advancing past %v (%q)\n", p.current().Type, p.current().Value)
+				p.advance()
 			}
 		}
 		op.ThenBranch = thenOps
@@ -1056,7 +903,6 @@ func (p *Parser) currentCompositionOp() *CompositionOpNode {
 		p.advance() // skip SET
 
 		variable := ""
-		// Handle both $variable and plain identifier (like "duration")
 		if p.current().Type == TOKEN_VARIABLE || p.current().Type == TOKEN_NODE_VARIABLE {
 			if p.current().Type == TOKEN_VARIABLE {
 				variable = p.current().Value[1:]
@@ -1064,36 +910,22 @@ func (p *Parser) currentCompositionOp() *CompositionOpNode {
 				variable = p.current().Value[5:]
 			}
 			p.advance()
-		} else if p.current().Type == TOKEN_CNAME && !isKeywordLike(p.current().Value) {
-			variable = p.current().Value
-			p.advance()
 		}
 
-		if variable == "" {
-			return nil // return nil on error (caller will handle)
-		}
-
-		// Handle different assignment syntaxes: TO expr, AT expr, AT LEAST expr
-		if !p.match(TOKEN_TO) && !p.match(TOKEN_AT) {
-			return nil // return nil if no valid keyword found
-		}
-
-		// Check for optional LEAST keyword (AT LEAST syntax)
-		if p.current().Value == "LEAST" {
-			p.advance() // skip LEAST
+		if !p.expect(TOKEN_TO) {
+			return nil
 		}
 
 		expr, err := p.parseExpression()
 		if err != nil {
-			return nil // return nil on expression parse error
+			return nil
 		}
 
-		op := &CompositionOpNode{
+		return &CompositionOpNode{
 			Type:       "SET",
 			Variable:   variable,
 			Expression: expr,
 		}
-		return op
 	}
 
 	return nil
@@ -1106,6 +938,7 @@ func (p *Parser) parseBooleanExpression() (BoolExprNode, error) {
 		return p.parseQuantifiedExpression()
 	}
 
+	fmt.Fprintf(os.Stderr, "DEBUG parseBooleanExpression: current=%v (%q)\n", p.current().Type, p.current().Value)
 
 	left, err := p.parseComparisonExpression()
 	if err != nil {
@@ -1204,12 +1037,13 @@ func (p *Parser) parseComparisonExpression() (BoolExprNode, error) {
 	}
 
 	current := p.current()
+	fmt.Fprintf(os.Stderr, "DEBUG parseComparisonExpression: after primary, current=%v (%q)\n", current.Type, current.Value)
 
 	// Check for comparison operators first: ==, !=, <, <=, >, >=
 	switch current.Type {
 	case TOKEN_EQUALS, TOKEN_NOT_EQUAL, TOKEN_LESS, TOKEN_LESS_EQ, TOKEN_GREATER, TOKEN_GREATER_EQ:
-		fmt.Fprintf(os.Stderr, "[DEBUG] Comparison op: type=%v val=%q\n", p.current().Type, p.current().Value)
-			p.advance() // consume the operator
+		fmt.Fprintf(os.Stderr, "DEBUG parseComparisonExpression: consuming %s\n", comparisonOpName(current.Type))
+		p.advance() // consume the operator
 		right, err := p.parseNumericExpression()
 		if err != nil {
 			return nil, err
@@ -1217,7 +1051,8 @@ func (p *Parser) parseComparisonExpression() (BoolExprNode, error) {
 
 		leftNode := toNumExpr(left)
 		rightNode := toNumExpr(right)
-	
+		fmt.Fprintf(os.Stderr, "DEBUG parseComparisonExpression: parsed comparison %v %s %v\n", left, comparisonOpName(current.Type), right)
+
 		return &BoolNumericCompareNode{
 			Left:     leftNode,
 			Operator: comparisonOpName(current.Type),
@@ -1418,13 +1253,15 @@ func (p *Parser) parsePrimaryExpression() (ASTNode, error) {
 			p.advance()
 
 			expr := &CountExpr{EventName: eventName}
-					// Check for optional scope filter: FROM source
+			fmt.Fprintf(os.Stderr, "DEBUG parsePrimaryExpression: parsed count #%s\n", eventName)
+			// Check for optional scope filter: FROM source
 			if p.isScopeFilter() {
 				p.advance() // consume FROM
 				fromToken := p.current()
 				if fromToken.Type == TOKEN_CNAME {
 					expr.Scope = &EventInstanceNode{Name: fromToken.Value}
-									p.advance()
+					fmt.Fprintf(os.Stderr, "DEBUG parsePrimaryExpression: scope filter %s\n", fromToken.Value)
+					p.advance()
 				}
 			}
 
@@ -1435,79 +1272,27 @@ func (p *Parser) parsePrimaryExpression() (ASTNode, error) {
 
 	if current.Type == TOKEN_VARIABLE || current.Type == TOKEN_NODE_VARIABLE || current.Type == TOKEN_NUMERIC_VARIABLE {
 		varName := ""
-		isNodeVar := false
 		switch current.Type {
 		case TOKEN_VARIABLE:
 			varName = current.Value[1:]
 		case TOKEN_NODE_VARIABLE:
 			varName = current.Value[5:]
-			isNodeVar = true
 		case TOKEN_NUMERIC_VARIABLE:
 			varName = current.Value[4:]
 		}
 		p.advance()
 
-		// Check for attribute access: $var.attr or Node$var.attr
-		if !p.eof() && p.current().Type == TOKEN_DOT {
-			p.advance() // skip '.'
-			if p.current().Type == TOKEN_CNAME || p.current().Type == TOKEN_VARIABLE {
-				attrName := p.current().Value
-				p.advance()
-
-				// Create attribute reference expression
-				return &AttrRefExprNode{
-					Variable:  varName,
-					IsNodeVar: isNodeVar,
-					Attribute: attrName,
-				}, nil
-			}
-			// Reset if not a valid attribute name
-			p.pos -= 2 // back up past '.' and current token
-		}
-
-		expr := &VarRefExpr{Value: varName, IsNodeVar: isNodeVar}
+		expr := &VarRefExpr{Value: varName}
 		// Check for optional scope filter: FROM source
 		if p.isScopeFilter() {
 			p.advance() // consume FROM
 			fromToken := p.current()
-			if fromToken.Type == TOKEN_CNAME || fromToken.Type == TOKEN_VARIABLE {
-				fromVar := ""
-				if fromToken.Type == TOKEN_CNAME {
-					fromVar = fromToken.Value
-				} else {
-					fromVar = fromToken.Value[1:] // strip $
-				}
+			if fromToken.Type == TOKEN_CNAME {
+				expr.Scope = &EventInstanceNode{Name: fromToken.Value}
 				p.advance()
-				expr.Scope = &EventInstanceNode{Name: fromVar}
 			}
 		}
 		return expr, nil
-	}
-
-	// Handle plain CNAME identifiers (like accumulated_total) and attribute access (GLOBAL.limit)
-	if current.Type == TOKEN_CNAME {
-		varName := p.current().Value
-		p.advance() // consume the identifier
-
-		// Check for attribute access: var.attr
-		if !p.eof() && p.current().Type == TOKEN_DOT {
-			p.advance() // skip '.'
-			if p.current().Type == TOKEN_CNAME || p.current().Type == TOKEN_VARIABLE {
-				attrName := p.current().Value
-				p.advance()
-
-				return &AttrRefExprNode{
-					Variable:  varName,
-					IsNodeVar: false,
-					Attribute: attrName,
-				}, nil
-			}
-			// Reset if not a valid attribute name
-			p.pos -= 2 // back up past '.' and current token
-		}
-
-		// Return as a simple variable reference
-		return &VarRefExpr{Value: varName, IsNodeVar: false}, nil
 	}
 
 	if current.Type == TOKEN_NUMBER_CONSTANT || current.Type == TOKEN_INTEGER_CONSTANT || current.Type == TOKEN_FLOAT_CONSTANT {
@@ -1899,68 +1684,5 @@ func isRelationName(name string) bool {
 		return true
 	default:
 		return false
-	}
-}
-
-// tryParseTopLevelAssignment attempts to parse a top-level assignment statement: var := expr; or var += expr;
-func tryParseTopLevelAssignment(p *Parser) StatementNode {
-	// Save position in case this isn't an assignment
-	savedPos := p.pos
-
-	// Check for variable name (CNAME, $variable, Node$variable)
-	if !isVariableStart(p.current()) {
-		p.pos = savedPos
-		return nil
-	}
-
-	var varName string
-	switch p.current().Type {
-	case TOKEN_CNAME:
-		varName = p.current().Value
-	case TOKEN_VARIABLE:
-		varName = p.current().Value[1:] // strip $
-	case TOKEN_NODE_VARIABLE:
-		varName = p.current().Value[5:] // strip Node$
-	default:
-		p.pos = savedPos
-		return nil
-	}
-	p.advance()
-
-	// Check for assignment operator
-	var opType string
-	switch {
-	case p.match(TOKEN_ASSIGN):
-		opType = ":="
-	case p.match(TOKEN_ADD_ASSIGN):
-		opType = "+="
-	case p.match(TOKEN_SUB_ASSIGN):
-		opType = "-="
-	case p.match(TOKEN_MUL_ASSIGN):
-		opType = "*="
-	case p.match(TOKEN_DIV_ASSIGN):
-		opType = "/="
-	default:
-		p.pos = savedPos
-		return nil
-	}
-
-	// Parse the right-hand side expression
-	expr, err := p.parseExpression()
-	if err != nil {
-		p.pos = savedPos
-		return nil
-	}
-
-	// Expect semicolon to complete the statement
-	if !p.match(TOKEN_SEMICOLON) {
-		p.pos = savedPos
-		return nil
-	}
-
-	return &AssignmentStatement{
-		Target:   &VarRefAttrExprNode{Name: varName},
-		Operator: opType,
-		Value:    expr,
 	}
 }

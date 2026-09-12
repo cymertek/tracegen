@@ -587,7 +587,15 @@ type CompositionOpNode struct {
 	NestedCoordinate *CoordinateNode // for nested COORDINATE operations
 	MapBody       []CompositionOpNode
 	Message       string
-	FailureAction *CompositionOpNode
+	FailureAction     *CompositionOpNode
+	TableName         string
+	FieldBindings     []FieldBindingNode
+}
+
+// FieldBindingNode represents a field binding in table assignment (name : value).
+type FieldBindingNode struct {
+	Name  string
+	Value ASTNode
 }
 
 func (c *CompositionOpNode) nodeType() string { return "composition_op" }
